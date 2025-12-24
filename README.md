@@ -22,6 +22,13 @@ Fleetman is a lightweight **controller + agent** system for deploying â€œcellsâ€
 ### Adding manifest
 <img width="806" height="886" alt="image" src="https://github.com/user-attachments/assets/d746572c-8d78-4139-99a3-a4bf1ef59511" />
 
+### Creating deployment
+<img width="1714" height="713" alt="image" src="https://github.com/user-attachments/assets/71ce24c8-20b4-4db8-be98-50b65ab9389b" />
+
+### Selecting files from staging directory
+<img width="810" height="513" alt="image" src="https://github.com/user-attachments/assets/cf795d28-27ca-4741-9f4d-4dabefbf776f" />
+
+
 ### Deployment 
 <img width="1723" height="641" alt="image" src="https://github.com/user-attachments/assets/aa5782f2-421e-43f4-8fe6-8818794fc5ea" />
 
