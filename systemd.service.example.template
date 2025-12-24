@@ -1,0 +1,16 @@
+[Unit]
+Description=${service_name} Service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/services/${cell_id}
+ExecStart=/opt/services/${cell_id}/run.sh
+Restart=on-failure
+RestartSec=5
+User=root
+Group=root
+
+[Install]
+WantedBy=multi-user.target
+

@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+
+{% block title %}Edit File - Fleetman{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1>{% if is_readonly %}<i class="bi bi-eye"></i> View File{% else %}Edit File{% endif %}: {{ file_path }}</h1>
+    <div>
+        {% if is_readonly %}
+        <a href="/deployments/download?manifest={{ manifest }}&version={{ version }}&file_path={{ file_path }}" class="btn btn-secondary me-2">
+            <i class="bi bi-download"></i> Download
+        </a>
+        {% endif %}
+        <a href="/deployments/start?manifest={{ manifest }}&version={{ version }}&edit=true" class="btn btn-secondary">
+            <i class="bi bi-arrow-left"></i> Back to Deployment
+        </a>
+    </div>
+</div>
+
+{% if is_readonly %}
+<div class="alert alert-info">
+    <i class="bi bi-shield-lock"></i> <strong>Read-Only View:</strong> This deployment has been sealed and cannot be modified.
+</div>
+{% endif %}
+
+<div class="card">
+    <div class="card-body">
+        {% if is_readonly %}
+            <div class="mb-3">
+                <label class="form-label">File Content (Read-Only)</label>
+                <textarea class="form-control" rows="20" style="font-family: monospace;" readonly>{{ content }}</textarea>
+            </div>
+            
+            <div class="d-flex justify-content-between">
+                <a href="/deployments/start?manifest={{ manifest }}&version={{ version }}&edit=true" class="btn btn-secondary">
+                    <i class="bi bi-arrow-left"></i> Back to Deployment
+                </a>
+                <a href="/deployments/download?manifest={{ manifest }}&version={{ version }}&file_path={{ file_path }}" class="btn btn-primary">
+                    <i class="bi bi-download"></i> Download File
+                </a>
+            </div>
+        {% else %}
+        <form method="post" action="/deployments/save">
+            <input type="hidden" name="manifest" value="{{ manifest }}">
+            <input type="hidden" name="version" value="{{ version }}">
+            <input type="hidden" name="file_path" value="{{ file_path }}">
+            
+            <div class="mb-3">
+                <label class="form-label">File Content</label>
+                <textarea class="form-control" name="content" rows="20" style="font-family: monospace;">{{ content }}</textarea>
+            </div>
+            
+            <div class="d-flex justify-content-between">
+                <a href="/deployments/start?manifest={{ manifest }}&version={{ version }}&edit=true" class="btn btn-secondary">Cancel</a>
+                <button type="submit" class="btn btn-primary">
+                    <i class="bi bi-save"></i> Save Changes
+                </button>
+            </div>
+        </form>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
+

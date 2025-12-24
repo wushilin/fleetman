@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+
+{% block title %}Dashboard - Fleetman{% endblock %}
+{% block nav_dashboard %}active{% endblock %}
+
+{% block content %}
+<h1 class="mb-4">Dashboard</h1>
+
+<div class="row">
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-body">
+                <h5 class="card-title"><i class="bi bi-bucket"></i> Buckets</h5>
+                <h2 class="mb-0">{{ bucket_count }}</h2>
+                <a href="/buckets" class="btn btn-sm btn-primary mt-3">Manage Buckets</a>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-body">
+                <h5 class="card-title"><i class="bi bi-file-earmark-text"></i> Manifests</h5>
+                <h2 class="mb-0">{{ manifest_count }}</h2>
+                <a href="/manifests" class="btn btn-sm btn-primary mt-3">Manage Manifests</a>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-4">
+        <div class="card">
+            <div class="card-body">
+                <h5 class="card-title"><i class="bi bi-rocket-takeoff"></i> Deployments</h5>
+                <h2 class="mb-0">Ready</h2>
+                <a href="/deployments" class="btn btn-sm btn-success mt-3">Create Deployment</a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card mt-4">
+    <div class="card-header">
+        <h5 class="mb-0">Quick Start</h5>
+    </div>
+    <div class="card-body">
+        <ol>
+            <li>Configure at least one <strong>Bucket</strong> (S3-compatible storage)</li>
+            <li>Create a <strong>Manifest</strong> defining your application structure</li>
+            <li>Create a <strong>Deployment</strong> and upload your files</li>
+            <li>Configure your fleetagent to monitor the deployment</li>
+        </ol>
+    </div>
+</div>
+{% endblock %}
+

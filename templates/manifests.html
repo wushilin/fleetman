@@ -1,0 +1,489 @@
+{% extends "base.html" %}
+
+{% block title %}Manifests - Fleetman{% endblock %}
+{% block nav_manifests %}active{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1>Deployment Manifests</h1>
+    <button type="button" class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addManifestModal">
+        <i class="bi bi-plus-circle"></i> Create Manifest
+    </button>
+</div>
+
+{% if manifests.is_empty() %}
+<div class="alert alert-info">
+    <i class="bi bi-info-circle"></i> No manifests configured yet. Create a manifest to define your application structure.
+</div>
+{% else %}
+<div class="row">
+    {% for (name, manifest) in manifests %}
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <strong>{{ name }}</strong>
+                <div>
+                    <a href="/manifests/edit?name={{ name }}" class="btn btn-sm btn-primary me-1">
+                        <i class="bi bi-pencil"></i> Edit
+                    </a>
+                    <form method="post" action="/manifests/delete" style="display: inline;">
+                        <input type="hidden" name="name" value="{{ name }}">
+                        <button type="submit" class="btn btn-sm btn-danger" 
+                                onclick="return confirm('Delete manifest {{ name }}?');">
+                            <i class="bi bi-trash"></i>
+                        </button>
+                    </form>
+                </div>
+            </div>
+            <div class="card-body">
+                <!-- app_name field removed - manifest name is used for S3 paths -->
+                <p><strong>Profile:</strong> <span class="badge bg-info">{{ manifest.profile }}</span></p>
+                <p><strong>Bucket:</strong> {{ manifest.bucket }}</p>
+                <p><strong>Files:</strong></p>
+                <ul class="small">
+                    {% for file in manifest.files %}
+                    <li><code>{{ file.path }}</code> <span class="badge bg-info">{{ file.file_type }}</span></li>
+                    {% endfor %}
+                </ul>
+                <a href="/deployments/create?manifest={{ name }}" class="btn btn-sm btn-success">
+                    <i class="bi bi-rocket-takeoff"></i> Create Deployment
+                </a>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+{% endif %}
+
+<!-- Add Manifest Modal -->
+<div class="modal fade" id="addManifestModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <form method="post" action="/manifests/add">
+                <div class="modal-header">
+                    <h5 class="modal-title">Create Manifest</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label">Manifest Name</label>
+                        <input type="text" class="form-control" name="name" required>
+                        <small class="form-text text-muted">This name will be used to identify the application and for S3 storage paths.</small>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Deployment Profile</label>
+                        <select class="form-select" name="profile" id="profileSelect" required onchange="handleProfileChange()">
+                            <option value="supervisor">Supervisor</option>
+                            <option value="systemd">Systemd</option>
+                            <option value="deploy">Deploy (files only)</option>
+                        </select>
+                        <small class="form-text text-muted">Supervisor/Systemd profiles will pre-populate with run.sh and logs/ folder</small>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Bucket</label>
+                        <select class="form-select" name="bucket" required>
+                            {% if buckets.is_empty() %}
+                            <option value="">No buckets configured</option>
+                            {% else %}
+                            {% for (display_name, bucket_config) in buckets %}
+                            <option value="{{ display_name }}">{{ display_name }}</option>
+                            {% endfor %}
+                            {% endif %}
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Files Configuration</label>
+                        <div id="filesList">
+                            <div class="file-entry mb-3 p-3 border rounded">
+                                <div class="row mb-2">
+                                    <div class="col-md-8">
+                                        <label class="form-label small">Path</label>
+                                        <input type="text" class="form-control form-control-sm file-path-input" placeholder="file path (e.g. my_binary, config.yaml, logs/)" required oninput="detectFileType(this)">
+                                    </div>
+                                    <div class="col-md-4">
+                                        <label class="form-label small">Type</label>
+                                        <select class="form-select form-select-sm file-type-select">
+                                            <option value="binary" selected>Binary</option>
+                                            <option value="text">Text</option>
+                                            <option value="folder">Folder</option>
+                                        </select>
+                                    </div>
+                                </div>
+                                <div class="row mb-2">
+                                    <div class="col-md-4">
+                                        <label class="form-label small">Owner</label>
+                                        <input type="text" class="form-control form-control-sm file-owner-input" placeholder="root" value="root">
+                                    </div>
+                                    <div class="col-md-4">
+                                        <label class="form-label small">Group</label>
+                                        <input type="text" class="form-control form-control-sm file-group-input" placeholder="root" value="root">
+                                    </div>
+                                    <div class="col-md-4">
+                                        <label class="form-label small">Mode</label>
+                                        <input type="text" class="form-control form-control-sm file-mode-input" placeholder="0600" value="0600">
+                                    </div>
+                                </div>
+                                <button type="button" class="btn btn-sm btn-danger remove-file" onclick="removeFile(this)">Remove</button>
+                            </div>
+                        </div>
+                        <button type="button" class="btn btn-sm btn-secondary" onclick="addFileEntry()">+ Add File</button>
+                        <input type="hidden" name="files" id="filesInput">
+                        <input type="hidden" name="file_types" id="fileTypesInput">
+                        <input type="hidden" name="owners" id="ownersInput">
+                        <input type="hidden" name="groups" id="groupsInput">
+                        <input type="hidden" name="modes" id="modesInput">
+                        <small class="form-text text-muted d-block mt-2">Configure each file with path, type, permissions (owner, group, mode)</small>
+                    </div>
+                    
+                    <div class="mb-3">
+                        <label class="form-label">Log Collection</label>
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" name="collect_logs" id="collectLogsModal" checked onchange="toggleLogFieldsModal()">
+                            <label class="form-check-label" for="collectLogsModal">
+                                Enable log collection on deployment failure (enabled by default)
+                            </label>
+                        </div>
+                        <small class="form-text text-muted">When enabled, the agent will collect logs from specified files if deployment fails</small>
+                    </div>
+                    
+                    <div id="logFieldsContainerModal" style="display: block;">
+                        <div class="mb-3">
+                            <label class="form-label">Log Files</label>
+                            <textarea class="form-control" name="log_files" id="logFilesModal" rows="4" 
+                                      placeholder="logs/stdout.log&#10;logs/stderr.log">logs/stdout.log&#10;logs/stderr.log</textarea>
+                            <small class="form-text text-muted">One file path per line. Paths are relative to service directory. No absolute paths or escapes allowed. Symbolic links are OK. Default: logs/stdout.log, logs/stderr.log</small>
+                        </div>
+                        
+                        <div class="mb-3">
+                            <label class="form-label">Max Lines per Log File</label>
+                            <input type="number" class="form-control" name="max_log_lines" value="30" min="1" max="10000" placeholder="30">
+                            <small class="form-text text-muted">Maximum number of lines to collect from each log file (default: 30)</small>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <div id="validationAlert" class="alert alert-danger me-auto" style="display: none; margin-bottom: 0;"></div>
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary" onclick="return validateAndCollectFiles()">Create Manifest</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<script>
+function detectFileType(input) {
+    const path = input.value.trim();
+    const entry = input.closest('.file-entry');
+    const select = entry.querySelector('.file-type-select');
+    const modeInput = entry.querySelector('.file-mode-input');
+    
+    // Auto-detect folder if path ends with '/'
+    if (path.endsWith('/')) {
+        select.value = 'folder';
+    }
+    
+    // Auto-set mode to 0700 for shell scripts
+    if (path.endsWith('.sh') || path.endsWith('.bash')) {
+        modeInput.value = '0700';
+        modeInput.classList.add('border-success');
+        setTimeout(() => modeInput.classList.remove('border-success'), 1000);
+    }
+}
+
+function addFileEntry() {
+    const filesList = document.getElementById('filesList');
+    const newEntry = document.createElement('div');
+    newEntry.className = 'file-entry mb-3 p-3 border rounded';
+    newEntry.innerHTML = `
+        <div class="row mb-2">
+            <div class="col-md-8">
+                <label class="form-label small">Path</label>
+                <input type="text" class="form-control form-control-sm file-path-input" placeholder="file path (e.g. my_binary, config.yaml, logs/)" required oninput="detectFileType(this)">
+            </div>
+            <div class="col-md-4">
+                <label class="form-label small">Type</label>
+                <select class="form-select form-select-sm file-type-select">
+                    <option value="binary" selected>Binary</option>
+                    <option value="text">Text</option>
+                    <option value="folder">Folder</option>
+                </select>
+            </div>
+        </div>
+        <div class="row mb-2">
+            <div class="col-md-4">
+                <label class="form-label small">Owner</label>
+                <input type="text" class="form-control form-control-sm file-owner-input" placeholder="root" value="root">
+            </div>
+            <div class="col-md-4">
+                <label class="form-label small">Group</label>
+                <input type="text" class="form-control form-control-sm file-group-input" placeholder="root" value="root">
+            </div>
+            <div class="col-md-4">
+                <label class="form-label small">Mode</label>
+                <input type="text" class="form-control form-control-sm file-mode-input" placeholder="0600" value="0600">
+            </div>
+        </div>
+        <button type="button" class="btn btn-sm btn-danger remove-file" onclick="removeFile(this)">Remove</button>
+    `;
+    filesList.appendChild(newEntry);
+}
+
+function removeFile(button) {
+    const entries = document.querySelectorAll('.file-entry');
+    if (entries.length > 1) {
+        button.closest('.file-entry').remove();
+    }
+}
+
+function validateAndCollectFiles() {
+    collectFiles();
+    
+    const alertDiv = document.getElementById('validationAlert');
+    
+    // Get all file entries
+    const entries = document.querySelectorAll('.file-entry');
+    
+    // Validate all file paths first (applies to all profiles)
+    for (const entry of entries) {
+        const path = entry.querySelector('.file-path-input').value.trim();
+        
+        // Check for invalid path patterns
+        if (path.startsWith('/')) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> File path cannot be an absolute path. Invalid path: <code>' + path + '</code><br>Use relative paths like <code>folder/file</code> or <code>folder/subfolder/</code>';
+            alertDiv.style.display = 'block';
+            window.scrollTo(0, 0);
+            return false;
+        }
+        
+        if (path.startsWith('../')) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> File path cannot start with parent directory reference. Invalid path: <code>' + path + '</code><br>Use relative paths like <code>folder/file</code> or <code>folder/subfolder/</code>';
+            alertDiv.style.display = 'block';
+            window.scrollTo(0, 0);
+            return false;
+        }
+        
+        if (path.startsWith('./')) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> File path cannot start with current directory reference. Invalid path: <code>' + path + '</code><br>Use relative paths like <code>folder/file</code> or <code>folder/subfolder/</code>';
+            alertDiv.style.display = 'block';
+            window.scrollTo(0, 0);
+            return false;
+        }
+        
+        // Check for path escape patterns anywhere in the path
+        if (path.includes('/./')) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> File path cannot contain current directory reference. Invalid path: <code>' + path + '</code><br>Remove <code>/./</code> patterns. Use simple paths like <code>folder/file</code>';
+            alertDiv.style.display = 'block';
+            window.scrollTo(0, 0);
+            return false;
+        }
+        
+        if (path.includes('/../')) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> File path cannot contain parent directory reference. Invalid path: <code>' + path + '</code><br>Remove <code>/../</code> patterns. Use simple paths like <code>folder/file</code>';
+            alertDiv.style.display = 'block';
+            window.scrollTo(0, 0);
+            return false;
+        }
+    }
+    
+    // Get profile
+    const profile = document.querySelector('select[name="profile"]').value.toLowerCase();
+    
+    // Only validate run.sh for supervisor/systemd profiles
+    if (profile !== 'supervisor' && profile !== 'systemd') {
+        return true;
+    }
+    
+    let runShFound = false;
+    let runShMode = null;
+    
+    // Check for run.sh and its mode
+    entries.forEach(entry => {
+        const path = entry.querySelector('.file-path-input').value.trim();
+        const mode = entry.querySelector('.file-mode-input').value.trim();
+        
+        if (path === 'run.sh') {
+            runShFound = true;
+            runShMode = mode;
+        }
+    });
+    
+    // Validate run.sh exists
+    if (!runShFound) {
+        alertDiv.innerHTML = '<strong>Validation Error:</strong> run.sh is required for ' + profile.charAt(0).toUpperCase() + profile.slice(1) + ' profile. Please add run.sh to the files list.';
+        alertDiv.style.display = 'block';
+        return false;
+    }
+    
+    // Validate run.sh permissions
+    if (runShMode) {
+        const modeStr = runShMode.replace(/^0+/, ''); // Remove leading zeros
+        const modeNum = parseInt(modeStr, 8); // Parse as octal
+        
+        if (isNaN(modeNum)) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> Invalid mode for run.sh: ' + runShMode + '. Mode must be an octal number (e.g., 0755).';
+            alertDiv.style.display = 'block';
+            return false;
+        }
+        
+        // Check if owner execute bit is set (bit 6 = 0o100)
+        if ((modeNum & 0o100) === 0) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> run.sh must be executable. Current mode: ' + runShMode + '. Owner must have execute permission. Suggested: 0700, 0750, or 0755.';
+            alertDiv.style.display = 'block';
+            return false;
+        }
+        
+        // Check if mode is at least 0700
+        if (modeNum < 0o700) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> run.sh must have at least 0700 permission. Current mode: ' + runShMode + '. Suggested: 0700, 0750, or 0755.';
+            alertDiv.style.display = 'block';
+            return false;
+        }
+    }
+    
+    // Validation passed
+    alertDiv.style.display = 'none';
+    return true;
+}
+
+function collectFiles() {
+    const entries = document.querySelectorAll('.file-entry');
+    const paths = [];
+    const types = [];
+    const owners = [];
+    const groups = [];
+    const modes = [];
+    
+    entries.forEach(entry => {
+        const path = entry.querySelector('.file-path-input').value.trim();
+        const type = entry.querySelector('.file-type-select').value;
+        const owner = entry.querySelector('.file-owner-input').value.trim() || 'root';
+        const group = entry.querySelector('.file-group-input').value.trim() || 'root';
+        const mode = entry.querySelector('.file-mode-input').value.trim() || '0600';
+        
+        if (path) {
+            paths.push(path);
+            types.push(type);
+            owners.push(owner);
+            groups.push(group);
+            modes.push(mode);
+        }
+    });
+    
+    document.getElementById('filesInput').value = paths.join('\n');
+    document.getElementById('fileTypesInput').value = types.join('\n');
+    document.getElementById('ownersInput').value = owners.join('\n');
+    document.getElementById('groupsInput').value = groups.join('\n');
+    document.getElementById('modesInput').value = modes.join('\n');
+}
+
+function toggleLogFieldsModal() {
+    const checkbox = document.getElementById('collectLogsModal');
+    const container = document.getElementById('logFieldsContainerModal');
+    container.style.display = checkbox.checked ? 'block' : 'none';
+}
+
+function handleProfileChange() {
+    const profile = document.getElementById('profileSelect').value;
+    const filesList = document.getElementById('filesList');
+    
+    // Only pre-populate for supervisor/systemd when list is empty
+    if (profile === 'supervisor' || profile === 'systemd') {
+        const entries = filesList.querySelectorAll('.file-entry');
+        let hasContent = false;
+        
+        // Check if there's any non-empty entry
+        entries.forEach(entry => {
+            const pathInput = entry.querySelector('.file-path-input');
+            if (pathInput && pathInput.value.trim()) {
+                hasContent = true;
+            }
+        });
+        
+        // Only add starter files if list is empty
+        if (!hasContent) {
+            filesList.innerHTML = '';
+            
+            // Add run.sh
+            const runShEntry = document.createElement('div');
+            runShEntry.className = 'file-entry mb-3 p-3 border rounded';
+            runShEntry.innerHTML = `
+                <div class="row mb-2">
+                    <div class="col-md-8">
+                        <label class="form-label small">Path</label>
+                        <input type="text" class="form-control form-control-sm file-path-input" value="run.sh" required oninput="detectFileType(this)">
+                    </div>
+                    <div class="col-md-4">
+                        <label class="form-label small">Type</label>
+                        <select class="form-select form-select-sm file-type-select">
+                            <option value="binary">Binary</option>
+                            <option value="text" selected>Text</option>
+                            <option value="folder">Folder</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="row mb-2">
+                    <div class="col-md-4">
+                        <label class="form-label small">Owner</label>
+                        <input type="text" class="form-control form-control-sm file-owner-input" value="root">
+                    </div>
+                    <div class="col-md-4">
+                        <label class="form-label small">Group</label>
+                        <input type="text" class="form-control form-control-sm file-group-input" value="root">
+                    </div>
+                    <div class="col-md-4">
+                        <label class="form-label small">Mode</label>
+                        <input type="text" class="form-control form-control-sm file-mode-input" value="0700">
+                    </div>
+                </div>
+                <button type="button" class="btn btn-sm btn-danger remove-file" onclick="removeFile(this)">Remove</button>
+            `;
+            
+            // Add logs/ folder
+            const logsEntry = document.createElement('div');
+            logsEntry.className = 'file-entry mb-3 p-3 border rounded';
+            logsEntry.innerHTML = `
+                <div class="row mb-2">
+                    <div class="col-md-8">
+                        <label class="form-label small">Path</label>
+                        <input type="text" class="form-control form-control-sm file-path-input" value="logs/" required oninput="detectFileType(this)">
+                    </div>
+                    <div class="col-md-4">
+                        <label class="form-label small">Type</label>
+                        <select class="form-select form-select-sm file-type-select">
+                            <option value="binary">Binary</option>
+                            <option value="text">Text</option>
+                            <option value="folder" selected>Folder</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="row mb-2">
+                    <div class="col-md-4">
+                        <label class="form-label small">Owner</label>
+                        <input type="text" class="form-control form-control-sm file-owner-input" value="root">
+                    </div>
+                    <div class="col-md-4">
+                        <label class="form-label small">Group</label>
+                        <input type="text" class="form-control form-control-sm file-group-input" value="root">
+                    </div>
+                    <div class="col-md-4">
+                        <label class="form-label small">Mode</label>
+                        <input type="text" class="form-control form-control-sm file-mode-input" value="0700">
+                    </div>
+                </div>
+                <button type="button" class="btn btn-sm btn-danger remove-file" onclick="removeFile(this)">Remove</button>
+            `;
+            
+            filesList.appendChild(runShEntry);
+            filesList.appendChild(logsEntry);
+        }
+    }
+}
+
+// Pre-populate on page load for default profile (supervisor)
+document.addEventListener('DOMContentLoaded', function() {
+    handleProfileChange();
+});
+</script>
+{% endblock %}
+

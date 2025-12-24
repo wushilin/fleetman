@@ -1,0 +1,3 @@
+noprofile
+copy target/x86_64-unknown-linux-musl/release/fleetagent oss://fleetman/prod/staging/fleetagent/
+copy target/x86_64-unknown-linux-musl/release/fleetman oss://fleetman/prod/staging/fleetagent/

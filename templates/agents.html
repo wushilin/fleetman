@@ -1,0 +1,209 @@
+{% extends "base.html" %}
+
+{% block title %}Agents - Fleetman{% endblock %}
+{% block nav_agents %}active{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h1 class="mb-0">Agents</h1>
+    <a class="btn btn-outline-secondary" href="/agents">
+        <i class="bi bi-arrow-clockwise"></i> Refresh
+    </a>
+</div>
+
+<div class="card mb-3">
+    <div class="card-body">
+        <div class="row g-3">
+            <div class="col-md-4">
+                <label for="filterNode" class="form-label small mb-1">Filter by Node</label>
+                <input type="text" class="form-control form-control-sm" id="filterNode"
+                       placeholder="Search node..." oninput="filterAgents()">
+            </div>
+            <div class="col-md-6">
+                <label for="filterCell" class="form-label small mb-1">Filter by Cell</label>
+                <input type="text" class="form-control form-control-sm" id="filterCell"
+                       placeholder="Search cell id..." oninput="filterAgents()">
+            </div>
+            <div class="col-md-2 d-flex align-items-end">
+                <button class="btn btn-sm btn-secondary w-100" type="button" onclick="clearAgentFilters()">Clear</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-hdd-network"></i> Agent Heartbeats</h5>
+        <span class="text-muted small">Active: &lt;3m • Warning: 3–10m • Dead: &gt;10m</span>
+    </div>
+    <div class="card-body">
+        {% if agents.is_empty() %}
+        <p class="text-muted mb-0">No agent status files found under <code>agents/</code> in any configured bucket.</p>
+        {% else %}
+        <div class="table-responsive">
+            <table class="table table-hover align-middle" id="agentsTable">
+                <thead>
+                    <tr>
+                        <th style="cursor: pointer;" onclick="sortAgentsTable('node')">
+                            Node <span id="sort-node" class="sort-indicator">⇅</span>
+                        </th>
+                        <th>Bucket</th>
+                        <th style="cursor: pointer;" onclick="sortAgentsTable('status')">
+                            Status <span id="sort-status" class="sort-indicator">⇅</span>
+                        </th>
+                        <th style="cursor: pointer;" onclick="sortAgentsTable('last_report')">
+                            Last Report <span id="sort-last_report" class="sort-indicator">⇅</span>
+                        </th>
+                        <th>Cells</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for a in agents %}
+                    <tr data-node="{{ a.node_id }}"
+                        data-status="{{ a.status_label }}"
+                        data-status-rank="{% if a.status_label == "Active" %}0{% else %}{% if a.status_label == "Warning" %}1{% else %}2{% endif %}{% endif %}"
+                        data-last-report="{{ a.last_report_timestamp }}"
+                        data-cells="{{ a.cells_joined }}">
+                        <td><strong>{{ a.node_id }}</strong></td>
+                        <td><code>{{ a.bucket_display }}</code></td>
+                        <td>
+                            <span class="badge {{ a.status_badge_class }}">{{ a.status_label }}</span>
+                            {% if a.age_seconds.is_some() %}
+                                <span class="text-muted small ms-2">{{ a.age_human }}</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            {% if a.last_report_human.is_empty() %}
+                                <span class="text-muted">-</span>
+                            {% else %}
+                                <span title="epoch: {{ a.last_report_timestamp }}">{{ a.last_report_human }}</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            {% if a.cells.is_empty() %}
+                                <span class="text-muted">None</span>
+                            {% else %}
+                                <ul class="mb-0 small">
+                                    {% for c in a.cells %}
+                                        <li class="mb-1">
+                                            <code>{{ c.cell_id }}</code>
+                                            <span class="text-muted ms-1">({{ c.manifest_name }}, {{ c.profile }})</span>
+                                            → <span class="badge bg-secondary">{{ c.version_display }}</span>
+                                            <span class="badge {{ c.running_badge_class }} ms-1">{{ c.running_label }}</span>
+                                        </li>
+                                    {% endfor %}
+                                </ul>
+                            {% endif %}
+                        </td>
+                        <td class="text-end">
+                            {% if a.is_dead %}
+                            <form method="post" action="/agents/delete" class="d-inline">
+                                <input type="hidden" name="bucket" value="{{ a.bucket_display }}">
+                                <input type="hidden" name="node_id" value="{{ a.node_id }}">
+                                <button class="btn btn-sm btn-outline-danger" type="submit"
+                                        onclick="return confirm('Delete agent status for ' + '{{ a.node_id }}' + ' in bucket ' + '{{ a.bucket_display }}' + '?');">
+                                    <i class="bi bi-trash"></i> Delete
+                                </button>
+                            </form>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let agentSort = { key: null, dir: 0 }; // 0 unsorted, 1 asc, -1 desc
+
+function filterAgents() {
+    const nodeFilter = document.getElementById('filterNode').value.toLowerCase();
+    const cellFilter = document.getElementById('filterCell').value.toLowerCase();
+    const table = document.getElementById('agentsTable');
+    const rows = table.querySelectorAll('tbody tr');
+
+    rows.forEach(row => {
+        const node = (row.dataset.node || '').toLowerCase();
+        const cells = (row.dataset.cells || '').toLowerCase();
+        const show = node.includes(nodeFilter) && cells.includes(cellFilter);
+        row.style.display = show ? '' : 'none';
+    });
+}
+
+function clearAgentFilters() {
+    document.getElementById('filterNode').value = '';
+    document.getElementById('filterCell').value = '';
+    filterAgents();
+}
+
+function sortAgentsTable(key) {
+    const table = document.getElementById('agentsTable');
+    const tbody = table.querySelector('tbody');
+    const rows = Array.from(tbody.querySelectorAll('tr'));
+
+    // toggle direction if same key, else set to asc
+    if (agentSort.key === key) {
+        agentSort.dir = agentSort.dir === 1 ? -1 : 1;
+    } else {
+        agentSort.key = key;
+        agentSort.dir = 1;
+    }
+
+    // update indicators
+    ['node', 'status', 'last_report'].forEach(k => {
+        const el = document.getElementById(`sort-${k}`);
+        if (!el) return;
+        if (k === agentSort.key) {
+            el.textContent = agentSort.dir === 1 ? '▲' : '▼';
+        } else {
+            el.textContent = '⇅';
+        }
+    });
+
+    const statusRank = (row) => parseInt(row.dataset.statusRank || '9', 10);
+    const lastReport = (row) => parseInt(row.dataset.lastReport || '0', 10);
+
+    rows.sort((a, b) => {
+        let av, bv;
+        if (key === 'node') {
+            av = (a.dataset.node || '').toLowerCase();
+            bv = (b.dataset.node || '').toLowerCase();
+        } else if (key === 'status') {
+            av = statusRank(a);
+            bv = statusRank(b);
+            return (av - bv) * agentSort.dir;
+        } else if (key === 'last_report') {
+            av = lastReport(a);
+            bv = lastReport(b);
+            // Default expectation: newest first when sorting last_report desc; our dir toggles it.
+            return (av - bv) * agentSort.dir;
+        } else {
+            av = '';
+            bv = '';
+        }
+        if (av < bv) return -1 * agentSort.dir;
+        if (av > bv) return 1 * agentSort.dir;
+        return 0;
+    });
+
+    rows.forEach(r => tbody.appendChild(r));
+}
+</script>
+
+<style>
+.sort-indicator {
+    font-size: 0.8rem;
+    color: #6c757d;
+    margin-left: 0.25rem;
+    user-select: none;
+}
+</style>
+{% endblock %}
+
+

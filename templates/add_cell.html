@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+
+{% block title %}Add Cell - Fleetman{% endblock %}
+
+{% block nav_cells %}active{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1>Add New Cell</h1>
+    <a href="/cells" class="btn btn-secondary">
+        <i class="bi bi-arrow-left"></i> Back to Cells
+    </a>
+</div>
+
+<div class="card">
+    <div class="card-body">
+        <form method="post" action="/cells/add">
+            <div class="mb-3">
+                <label for="node_id" class="form-label">Node ID</label>
+                <input type="text" class="form-control" id="node_id" name="node_id" 
+                       required placeholder="e.g., baba" autofocus>
+                <div class="form-text">The physical host identifier</div>
+            </div>
+            <div class="mb-3">
+                <label for="cell_id" class="form-label">Cell ID</label>
+                <input type="text" class="form-control" id="cell_id" name="cell_id" 
+                       required placeholder="e.g., myapp01">
+                <div class="form-text">The deployment instance identifier</div>
+            </div>
+            <div class="mb-3">
+                <label for="bucket" class="form-label">Bucket</label>
+                <select class="form-select" id="bucket" name="bucket" required>
+                    <option value="">Select a bucket...</option>
+                    {% for bucket in buckets %}
+                    <option value="{{ bucket }}">{{ bucket }}</option>
+                    {% endfor %}
+                </select>
+                <div class="form-text">S3 bucket to use for this cell</div>
+            </div>
+            <div class="mb-3">
+                <label for="manifest" class="form-label">Manifest</label>
+                <select class="form-select" id="manifest" name="manifest" required>
+                    <option value="">Select a manifest...</option>
+                    {% for (manifest_name, _) in manifests %}
+                    <option value="{{ manifest_name }}">{{ manifest_name }}</option>
+                    {% endfor %}
+                </select>
+                <div class="form-text">Manifest to deploy to this cell</div>
+            </div>
+            
+            <div class="d-flex justify-content-between mt-4">
+                <a href="/cells" class="btn btn-secondary">Cancel</a>
+                <button type="submit" class="btn btn-primary">
+                    <i class="bi bi-plus-circle"></i> Add Cell
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endblock %}
+

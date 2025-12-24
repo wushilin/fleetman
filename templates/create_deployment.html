@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+
+{% block title %}Create New Deployment - Fleetman{% endblock %}
+{% block nav_deployments %}active{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1>Create New Deployment</h1>
+    <a href="/deployments" class="btn btn-secondary">
+        <i class="bi bi-arrow-left"></i> Back to Deployments
+    </a>
+</div>
+
+{% if manifests.is_empty() %}
+<div class="alert alert-warning">
+    <i class="bi bi-exclamation-triangle"></i> No manifests available. Please <a href="/manifests">create a manifest</a> first.
+</div>
+{% else %}
+<div class="card">
+    <div class="card-body">
+        <form method="get" action="/deployments/start">
+            <div class="row">
+                <div class="col-md-6 mb-3">
+                    <label class="form-label">Manifest</label>
+                    <select class="form-select" name="manifest" id="manifestSelect" required autofocus>
+                        <option value="">Select a manifest...</option>
+                        {% for name in manifests %}
+                        <option value="{{ name }}">{{ name }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-6 mb-3">
+                    <label class="form-label">Version</label>
+                    <input type="text" class="form-control" name="version" id="versionInput"
+                           placeholder="v1.0.0" required pattern="v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)">
+                    <small class="form-text text-muted">Format: v&lt;major&gt;.&lt;minor&gt;.&lt;patch&gt; (e.g., v1.0.0, v2.10.3)</small>
+                    <small class="form-text text-danger d-none" id="versionError">Invalid format. No leading zeros allowed (e.g., v1.02.0 is invalid).</small>
+                </div>
+            </div>
+            
+            <div class="d-flex justify-content-between mt-4">
+                <a href="/deployments" class="btn btn-secondary">Cancel</a>
+                <button type="submit" class="btn btn-primary" id="startDeploymentBtn">
+                    <i class="bi bi-rocket-takeoff"></i> Create Deployment
+                </button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script>
+// Version validation
+const versionInput = document.getElementById('versionInput');
+const versionError = document.getElementById('versionError');
+const startBtn = document.getElementById('startDeploymentBtn');
+
+versionInput.addEventListener('input', function() {
+    const value = this.value;
+    const pattern = /^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
+    
+    if (value && !pattern.test(value)) {
+        versionError.classList.remove('d-none');
+        this.classList.add('is-invalid');
+        startBtn.disabled = true;
+    } else {
+        versionError.classList.add('d-none');
+        this.classList.remove('is-invalid');
+        startBtn.disabled = false;
+    }
+});
+</script>
+{% endif %}
+{% endblock %}
+

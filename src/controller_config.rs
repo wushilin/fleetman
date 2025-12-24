@@ -1,0 +1,226 @@
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ControllerConfig {
+    pub buckets: HashMap<String, BucketConfig>,
+    pub manifests: HashMap<String, DeploymentManifest>,
+    #[serde(default)]
+    pub cells: HashMap<String, CellConfig>,
+    #[serde(default = "default_s3_retry_count")]
+    pub s3_retry_count: u32,
+    #[serde(default = "default_s3_retry_delay_ms")]
+    pub s3_retry_delay_ms: u64,
+}
+
+fn default_s3_retry_count() -> u32 {
+    3
+}
+
+fn default_s3_retry_delay_ms() -> u64 {
+    1000
+}
+
+impl ControllerConfig {
+    pub fn new() -> Self {
+        Self {
+            buckets: HashMap::new(),
+            manifests: HashMap::new(),
+            cells: HashMap::new(),
+            s3_retry_count: default_s3_retry_count(),
+            s3_retry_delay_ms: default_s3_retry_delay_ms(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct BucketConfig {
+    pub bucket_name: String,
+    pub endpoint: String,
+    pub access_key: String,
+    pub secret_key: String,
+    pub path_style: bool,
+    pub prefix: String,  // Required: must contain only alphanumerics, hyphens, and underscores
+}
+
+impl BucketConfig {
+    /// Validate prefix format
+    /// - Required (cannot be empty)
+    /// - Must contain only alphanumerics (a-z, A-Z, 0-9), hyphens (-), and underscores (_)
+    pub fn validate_prefix(prefix: &str) -> Result<(), String> {
+        if prefix.is_empty() {
+            return Err("Prefix is required and cannot be empty".to_string());
+        }
+        
+        // Check that prefix contains only allowed characters
+        if !prefix.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_') {
+            return Err("Prefix can only contain alphanumerics (a-z, A-Z, 0-9), hyphens (-), and underscores (_)".to_string());
+        }
+        
+        Ok(())
+    }
+    
+    /// Get the full S3 key with prefix prepended
+    pub fn full_key(&self, key: &str) -> String {
+        format!("{}/{}", self.prefix, key)
+    }
+    
+    /// Strip the prefix from a full S3 key to get the relative key
+    /// Returns the stripped key
+    pub fn strip_prefix<'a>(&self, full_key: &'a str) -> Option<&'a str> {
+        let prefix_with_slash = format!("{}/", self.prefix);
+        full_key.strip_prefix(&prefix_with_slash)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct DeploymentManifest {
+    pub files: Vec<ManifestFile>,
+    pub profile: DeploymentProfile,
+    pub bucket: String,  // Reference to bucket name in config
+    #[serde(default = "default_collect_logs")]
+    pub collect_logs: bool,
+    #[serde(default = "default_log_files")]
+    pub log_files: Vec<String>,
+    #[serde(default = "default_max_log_lines")]
+    pub max_log_lines: usize,
+}
+
+fn default_collect_logs() -> bool {
+    true
+}
+
+fn default_log_files() -> Vec<String> {
+    vec![
+        "logs/stdout.log".to_string(),
+        "logs/stderr.log".to_string(),
+    ]
+}
+
+fn default_max_log_lines() -> usize {
+    30
+}
+
+impl DeploymentManifest {
+    /// Create a snapshot of this manifest for a specific deployment
+    pub fn to_snapshot(&self, manifest_name: &str, version: &str) -> ManifestSnapshot {
+        ManifestSnapshot {
+            manifest_name: manifest_name.to_string(),
+            version: version.to_string(),
+            files: self.files.clone(),
+            profile: self.profile.clone(),
+            bucket: self.bucket.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            collect_logs: self.collect_logs,
+            log_files: self.log_files.clone(),
+            max_log_lines: self.max_log_lines,
+        }
+    }
+}
+
+/// Snapshot of a manifest at deployment creation time
+/// This is saved as manifest.json in each deployment version
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ManifestSnapshot {
+    pub manifest_name: String,
+    pub version: String,
+    pub files: Vec<ManifestFile>,
+    pub profile: DeploymentProfile,
+    pub bucket: String,
+    pub created_at: String,  // ISO 8601 timestamp
+    #[serde(default = "default_collect_logs")]
+    pub collect_logs: bool,
+    #[serde(default = "default_log_files")]
+    pub log_files: Vec<String>,
+    #[serde(default = "default_max_log_lines")]
+    pub max_log_lines: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ManifestFile {
+    pub path: String,
+    pub file_type: FileType,
+    #[serde(default = "default_owner")]
+    pub owner: String,
+    #[serde(default = "default_group")]
+    pub group: String,
+    #[serde(default = "default_mode")]
+    pub mode: String,
+}
+
+fn default_owner() -> String {
+    "root".to_string()
+}
+
+fn default_group() -> String {
+    "root".to_string()
+}
+
+fn default_mode() -> String {
+    "0600".to_string()
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum FileType {
+    Text,
+    Binary,
+    Folder,
+}
+
+impl std::fmt::Display for FileType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FileType::Text => write!(f, "text"),
+            FileType::Binary => write!(f, "binary"),
+            FileType::Folder => write!(f, "folder"),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DeploymentProfile {
+    Supervisor,
+    Systemd,
+    Deploy,
+}
+
+impl std::fmt::Display for DeploymentProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DeploymentProfile::Supervisor => write!(f, "supervisor"),
+            DeploymentProfile::Systemd => write!(f, "systemd"),
+            DeploymentProfile::Deploy => write!(f, "deploy"),
+        }
+    }
+}
+
+impl std::str::FromStr for DeploymentProfile {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "supervisor" => Ok(DeploymentProfile::Supervisor),
+            "systemd" => Ok(DeploymentProfile::Systemd),
+            "deploy" => Ok(DeploymentProfile::Deploy),
+            _ => Err(format!("Unknown profile: {}. Must be 'supervisor', 'systemd', or 'deploy'", s)),
+        }
+    }
+}
+
+// Cell Management
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct CellConfig {
+    pub node_id: String,
+    pub cell_id: String,
+    pub bucket: String,
+    pub manifest: String,  // References manifest by KEY (HashMap key)
+}
+
+impl CellConfig {
+    pub fn full_name(&self) -> String {
+        format!("{}/{}", self.node_id, self.cell_id)
+    }
+}
+

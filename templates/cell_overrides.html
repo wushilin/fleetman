@@ -1,0 +1,565 @@
+{% extends "base.html" %}
+
+{% block title %}Cell Overrides: {{ node_id }}/{{ cell_id }} - Fleetman{% endblock %}
+
+{% block nav_cells %}active{% endblock %}
+
+{% block content %}
+<div class="mb-3">
+    <a href="/cells" class="btn btn-secondary">&larr; Back to Cells</a>
+</div>
+
+<h1>Cell Overrides: <span class="text-primary">{{ node_id }}/{{ cell_id }}</span></h1>
+<p class="text-muted">Bucket: <strong>{{ bucket }}</strong></p>
+
+<div class="card mb-4">
+    <div class="card-header">
+        <h5 class="mb-0">Override Files</h5>
+    </div>
+    <div class="card-body">
+        {% if overrides.is_empty() %}
+        <p class="text-muted">No override files defined yet.</p>
+        {% else %}
+        <div class="table-responsive">
+            <table class="table table-striped">
+                <thead>
+                    <tr>
+                        <th>File Path</th>
+                        <th>Type</th>
+                        <th>Owner:Group</th>
+                        <th>Mode</th>
+                        <th>Size</th>
+                        <th>Last Modified</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for file in overrides %}
+                    <tr>
+                        <td><code>{{ file.path }}</code></td>
+                        <td><span class="badge bg-secondary">{{ file.file_type }}</span></td>
+                        <td>{{ file.owner }}:{{ file.group }}</td>
+                        <td><code>{{ file.mode }}</code></td>
+                        <td>{% if file.is_folder %}-{% else %}{{ file.size }} bytes{% endif %}</td>
+                        <td>{{ file.last_modified }}</td>
+                        <td>
+                            {% if file.file_type == "text" %}
+                            <a href="/cells/{{ node_id }}/{{ cell_id }}/overrides/edit?file_path={{ file.path }}" 
+                               class="btn btn-sm btn-primary">Edit</a>
+                            {% else %}
+                            <button type="button" class="btn btn-sm btn-secondary" disabled>Edit</button>
+                            {% endif %}
+                            <button type="button" class="btn btn-sm btn-info" 
+                                    onclick="showEditMetaModal('{{ file.path }}', '{{ file.file_type }}', '{{ file.owner }}', '{{ file.group }}', '{{ file.mode }}')">
+                                Edit Meta
+                            </button>
+                            <form method="post" action="/cells/{{ node_id }}/{{ cell_id }}/overrides/delete" 
+                                  style="display:inline;">
+                                <input type="hidden" name="file_path" value="{{ file.path }}">
+                                <button type="submit" class="btn btn-sm btn-danger"
+                                        onclick="return confirm('Are you sure you want to delete {{ file.path }}?');">
+                                    Delete
+                                </button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        <h5 class="mb-0">Add New Override File</h5>
+    </div>
+    <div class="card-body">
+        <form method="post" action="/cells/{{ node_id }}/{{ cell_id }}/overrides/upload" 
+              enctype="multipart/form-data" id="overrideForm" onsubmit="return validateOverridePath()">
+            <div class="mb-3">
+                <label for="file_path" class="form-label">File Path</label>
+                <input type="text" class="form-control" id="file_path" name="file_path" 
+                       required placeholder="config/app.conf or logs/" oninput="inferFileMetadata()">
+                <div class="form-text">Path within the overrides folder (e.g., config/app.conf, myfile.txt, or logs/ for folder)</div>
+                <div id="pathValidationError" class="text-danger small" style="display: none;"></div>
+            </div>
+            
+            <div class="mb-3">
+                <label for="file_type" class="form-label">File Type</label>
+                <select class="form-control" id="file_type" name="file_type" onchange="updateFileTypeUI()">
+                    <option value="text">Text</option>
+                    <option value="binary">Binary</option>
+                    <option value="folder">Folder</option>
+                </select>
+                <div class="form-text">Auto-detected based on path</div>
+            </div>
+            
+            <div class="mb-3" id="sourceSection">
+                <label class="form-label">Source</label>
+                <div class="form-check">
+                    <input class="form-check-input" type="radio" name="source_type" id="sourceUpload" 
+                           value="upload" checked onchange="toggleSourceType()">
+                    <label class="form-check-label" for="sourceUpload">
+                        Upload from Computer
+                    </label>
+                </div>
+                <div class="form-check">
+                    <input class="form-check-input" type="radio" name="source_type" id="sourceStaging" 
+                           value="staging" onchange="toggleSourceType()">
+                    <label class="form-check-label" for="sourceStaging">
+                        Copy from Staging
+                    </label>
+                </div>
+            </div>
+            
+            <div class="mb-3" id="uploadSection">
+                <label for="file" class="form-label">Select File</label>
+                <input type="file" class="form-control" id="file" name="file">
+            </div>
+            
+            <div class="mb-3" id="stagingSection" style="display: none;">
+                <label class="form-label">Staging File</label>
+                <div class="input-group">
+                    <input type="text" class="form-control" id="staging_path" name="staging_path" 
+                           readonly placeholder="Click Browse to select...">
+                    <button type="button" class="btn btn-outline-secondary" onclick="showOverrideStagingModal()">
+                        <i class="bi bi-folder"></i> Browse Staging
+                    </button>
+                </div>
+            </div>
+            
+            <div class="row">
+                <div class="col-md-4">
+                    <div class="mb-3">
+                        <label for="owner" class="form-label">Owner</label>
+                        <input type="text" class="form-control" id="owner" name="owner" value="root" required>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="mb-3">
+                        <label for="group" class="form-label">Group</label>
+                        <input type="text" class="form-control" id="group" name="group" value="root" required>
+                    </div>
+                </div>
+                <div class="col-md-4">
+                    <div class="mb-3">
+                        <label for="mode" class="form-label">Mode</label>
+                        <input type="text" class="form-control" id="mode" name="mode" value="0644" required pattern="0[0-7]{3}">
+                        <div class="form-text">Octal format (e.g., 0644, 0755)</div>
+                    </div>
+                </div>
+            </div>
+            
+            <button type="submit" class="btn btn-primary">Add Override</button>
+        </form>
+    </div>
+</div>
+
+<!-- Staging Browser Modal -->
+<div class="modal fade" id="overrideStagingModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Select File from Staging</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="mb-3">
+                    <label class="form-label">Current Path:</label>
+                    <div class="input-group">
+                        <span class="input-group-text">staging/</span>
+                        <input type="text" class="form-control" id="overrideStagingPath" readonly>
+                        <button class="btn btn-outline-secondary" type="button" id="overrideStagingUpBtn" onclick="navigateUpOverrideStaging()">
+                            <i class="bi bi-arrow-up"></i> Up
+                        </button>
+                        <button class="btn btn-outline-secondary" type="button" onclick="refreshOverrideStaging()">
+                            <i class="bi bi-arrow-clockwise"></i> Refresh
+                        </button>
+                    </div>
+                </div>
+                <div class="mb-3">
+                    <label class="form-label">Filter:</label>
+                    <input type="text" class="form-control" id="overrideStagingSearchInput" 
+                           placeholder="Type to filter files..." oninput="renderOverrideStagingItems()">
+                </div>
+                <div id="overrideStagingFilesList" style="max-height: 400px; overflow-y: auto;">
+                    Loading...
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Edit Metadata Modal -->
+<div class="modal fade" id="editMetaModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Edit Override Metadata</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form method="post" action="/cells/{{ node_id }}/{{ cell_id }}/overrides/update-meta" id="editMetaForm">
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label">File Path</label>
+                        <input type="text" class="form-control" id="editMetaPath" name="file_path" readonly>
+                    </div>
+                    <div class="mb-3">
+                        <label for="editMetaFileType" class="form-label">File Type</label>
+                        <select class="form-control" id="editMetaFileType" name="file_type">
+                            <option value="text">Text</option>
+                            <option value="binary">Binary</option>
+                            <option value="folder">Folder</option>
+                        </select>
+                    </div>
+                    <div class="row">
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label for="editMetaOwner" class="form-label">Owner</label>
+                                <input type="text" class="form-control" id="editMetaOwner" name="owner" required>
+                            </div>
+                        </div>
+                        <div class="col-md-6">
+                            <div class="mb-3">
+                                <label for="editMetaGroup" class="form-label">Group</label>
+                                <input type="text" class="form-control" id="editMetaGroup" name="group" required>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="mb-3">
+                        <label for="editMetaMode" class="form-label">Mode</label>
+                        <input type="text" class="form-control" id="editMetaMode" name="mode" required pattern="0[0-7]{3}">
+                        <div class="form-text">Octal format (e.g., 0644, 0755)</div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<script>
+let overrideStagingItems = [];
+let overrideStagingPath = '';
+let overrideStagingSortField = 'name';
+let overrideStagingSortAsc = true;
+const overrideBucket = '{{ bucket }}';
+
+function validateOverridePathInput() {
+    const path = document.getElementById('file_path').value.trim();
+    const errorDiv = document.getElementById('pathValidationError');
+    
+    if (!path) {
+        errorDiv.style.display = 'none';
+        return true;
+    }
+    
+    // Check for invalid patterns (allow trailing / for folders)
+    if (path.startsWith('/') || path.startsWith('../') || path.startsWith('./') || 
+        path.includes('/./') || path.includes('/../')) {
+        errorDiv.textContent = 'Invalid path. Cannot use /, ../, ./, or path escape patterns. Use format: file.txt, folder/file.txt, or folder/';
+        errorDiv.style.display = 'block';
+        return false;
+    }
+    
+    errorDiv.style.display = 'none';
+    return true;
+}
+
+function inferFileMetadata() {
+    validateOverridePathInput();
+    
+    const path = document.getElementById('file_path').value.trim();
+    const fileTypeSelect = document.getElementById('file_type');
+    const modeInput = document.getElementById('mode');
+    
+    if (!path) return;
+    
+    // Infer file type
+    if (path.endsWith('/')) {
+        // Folder
+        fileTypeSelect.value = 'folder';
+        modeInput.value = '0755';
+    } else if (path.match(/\.(sh|bash)$/)) {
+        // Shell script
+        fileTypeSelect.value = 'text';
+        // Ensure at least 0700 for shell scripts
+        const currentMode = parseInt(modeInput.value, 8);
+        if (currentMode < 0o700) {
+            modeInput.value = '0700';
+        }
+    } else if (path.match(/\.(txt|conf|config|yml|yaml|json|xml|ini|properties|log|md|rst|csv)$/i)) {
+        // Common text file extensions
+        fileTypeSelect.value = 'text';
+        if (modeInput.value === '0755' || modeInput.value === '0700') {
+            modeInput.value = '0644';
+        }
+    } else {
+        // Default to binary
+        fileTypeSelect.value = 'binary';
+        if (modeInput.value === '0755' || modeInput.value === '0700') {
+            modeInput.value = '0644';
+        }
+    }
+    
+    updateFileTypeUI();
+}
+
+function updateFileTypeUI() {
+    const fileType = document.getElementById('file_type').value;
+    const sourceSection = document.getElementById('sourceSection');
+    const uploadSection = document.getElementById('uploadSection');
+    const stagingSection = document.getElementById('stagingSection');
+    const sourceUpload = document.getElementById('sourceUpload');
+    const sourceStaging = document.getElementById('sourceStaging');
+    const fileInput = document.getElementById('file');
+    
+    if (fileType === 'folder') {
+        // Hide entire source section for folders
+        sourceSection.style.display = 'none';
+        uploadSection.style.display = 'none';
+        stagingSection.style.display = 'none';
+        fileInput.required = false;
+    } else {
+        // Show source section for files
+        sourceSection.style.display = 'block';
+        
+        // Show appropriate source section
+        if (sourceUpload.checked) {
+            uploadSection.style.display = 'block';
+            stagingSection.style.display = 'none';
+            fileInput.required = true;
+        } else if (sourceStaging.checked) {
+            uploadSection.style.display = 'none';
+            stagingSection.style.display = 'block';
+            fileInput.required = false;
+        }
+    }
+}
+
+function validateOverridePath() {
+    if (!validateOverridePathInput()) {
+        return false;
+    }
+    
+    const fileType = document.getElementById('file_type').value;
+    
+    // Folders don't need file selection
+    if (fileType === 'folder') {
+        return true;
+    }
+    
+    const sourceType = document.querySelector('input[name="source_type"]:checked').value;
+    
+    if (sourceType === 'upload') {
+        const fileInput = document.getElementById('file');
+        if (!fileInput.files || fileInput.files.length === 0) {
+            alert('Please select a file to upload');
+            return false;
+        }
+    } else if (sourceType === 'staging') {
+        const stagingPath = document.getElementById('staging_path').value;
+        if (!stagingPath) {
+            alert('Please select a file from staging');
+            return false;
+        }
+    }
+    
+    return true;
+}
+
+function toggleSourceType() {
+    updateFileTypeUI();
+}
+
+function showOverrideStagingModal() {
+    overrideStagingPath = '';
+    overrideStagingSortField = 'name';
+    overrideStagingSortAsc = true;
+    document.getElementById('overrideStagingPath').value = '';
+    document.getElementById('overrideStagingSearchInput').value = '';
+    browseOverrideStagingFolder('');
+    new bootstrap.Modal(document.getElementById('overrideStagingModal')).show();
+}
+
+function browseOverrideStagingFolder(path) {
+    overrideStagingPath = path;
+    document.getElementById('overrideStagingPath').value = path || '(root)';
+    document.getElementById('overrideStagingUpBtn').disabled = !path;
+    document.getElementById('overrideStagingSearchInput').value = '';
+    
+    const url = `/deployments/staging/browse?bucket=${encodeURIComponent(overrideBucket)}&path=${encodeURIComponent(path)}`;
+    
+    document.getElementById('overrideStagingFilesList').innerHTML = '<div class="alert alert-info">Loading...</div>';
+    
+    fetch(url)
+        .then(r => {
+            console.log('Staging browse response status:', r.status);
+            return r.json();
+        })
+        .then(items => {
+            console.log('Staging items received:', items);
+            overrideStagingItems = items;
+            renderOverrideStagingItems();
+        })
+        .catch(err => {
+            console.error('Failed to load staging files:', err);
+            document.getElementById('overrideStagingFilesList').innerHTML = 
+                '<div class="alert alert-danger">Failed to load staging files: ' + err.message + '</div>';
+        });
+}
+
+function navigateUpOverrideStaging() {
+    if (!overrideStagingPath) return;
+    const parts = overrideStagingPath.split('/');
+    parts.pop();
+    const parentPath = parts.join('/');
+    browseOverrideStagingFolder(parentPath);
+}
+
+function refreshOverrideStaging() {
+    browseOverrideStagingFolder(overrideStagingPath);
+}
+
+function sortOverrideStagingBy(field) {
+    if (overrideStagingSortField === field) {
+        overrideStagingSortAsc = !overrideStagingSortAsc;
+    } else {
+        overrideStagingSortField = field;
+        overrideStagingSortAsc = true;
+    }
+    renderOverrideStagingItems();
+}
+
+function renderOverrideStagingItems() {
+    const list = document.getElementById('overrideStagingFilesList');
+    if (overrideStagingItems.length === 0) {
+        list.innerHTML = '<div class="alert alert-info">No files or folders found in staging.</div>';
+        return;
+    }
+    
+    const searchTerm = (document.getElementById('overrideStagingSearchInput')?.value || '').toLowerCase().trim();
+    let filtered = overrideStagingItems;
+    if (searchTerm) {
+        filtered = overrideStagingItems.filter(item => item.name.toLowerCase().includes(searchTerm));
+    }
+    
+    if (filtered.length === 0) {
+        list.innerHTML = '<div class="alert alert-warning">No files or folders match your filter.</div>';
+        return;
+    }
+    
+    const sorted = [...filtered].sort((a, b) => {
+        if (a.is_folder !== b.is_folder) return a.is_folder ? -1 : 1;
+        let aVal, bVal;
+        if (overrideStagingSortField === 'name') {
+            aVal = a.name.toLowerCase();
+            bVal = b.name.toLowerCase();
+        } else if (overrideStagingSortField === 'size') {
+            aVal = a.size || 0;
+            bVal = b.size || 0;
+        } else if (overrideStagingSortField === 'modified') {
+            aVal = a.last_modified || 0;
+            bVal = b.last_modified || 0;
+        }
+        if (aVal < bVal) return overrideStagingSortAsc ? -1 : 1;
+        if (aVal > bVal) return overrideStagingSortAsc ? 1 : -1;
+        return 0;
+    });
+    
+    let html = `<table class="table table-sm table-hover">
+        <thead><tr>
+            <th style="cursor: pointer;" onclick="sortOverrideStagingBy('name')">
+                Name ${overrideStagingSortField === 'name' ? (overrideStagingSortAsc ? '▲' : '▼') : ''}
+            </th>
+            <th style="cursor: pointer;" onclick="sortOverrideStagingBy('size')">
+                Size ${overrideStagingSortField === 'size' ? (overrideStagingSortAsc ? '▲' : '▼') : ''}
+            </th>
+            <th style="cursor: pointer;" onclick="sortOverrideStagingBy('modified')">
+                Modified ${overrideStagingSortField === 'modified' ? (overrideStagingSortAsc ? '▲' : '▼') : ''}
+            </th>
+        </tr></thead><tbody>`;
+    
+    sorted.forEach(item => {
+        const sizeStr = item.is_folder ? '-' : (item.size ? formatBytes(item.size) : 'N/A');
+        const modifiedStr = item.is_folder ? '-' : (item.last_modified ? formatTimestamp(item.last_modified) : 'N/A');
+        const icon = item.is_folder ? 'bi-folder' : 'bi-file-earmark';
+        const nameDisplay = item.is_folder ? `${item.name}/` : item.name;
+        const clickHandler = item.is_folder 
+            ? `browseOverrideStagingFolder('${item.path}')`
+            : `selectOverrideStagingFile('${item.path}')`;
+        
+        html += `<tr style="cursor: pointer;" onclick="${clickHandler}">
+            <td><i class="bi ${icon}"></i> ${nameDisplay}</td>
+            <td><small>${sizeStr}</small></td>
+            <td><small>${modifiedStr}</small></td>
+        </tr>`;
+    });
+    
+    html += '</tbody></table>';
+    list.innerHTML = html;
+}
+
+function selectOverrideStagingFile(stagingPath) {
+    document.getElementById('staging_path').value = stagingPath;
+    bootstrap.Modal.getInstance(document.getElementById('overrideStagingModal')).hide();
+}
+
+function formatBytes(bytes) {
+    if (bytes === null || bytes === undefined) return 'N/A';
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return Math.round(bytes / Math.pow(k, i) * 100) / 100 + ' ' + sizes[i];
+}
+
+function formatTimestamp(timestamp) {
+    if (!timestamp || timestamp === 'Unknown') return 'N/A';
+    try {
+        let date;
+        if (typeof timestamp === 'number') {
+            date = new Date(timestamp * 1000);
+        } else if (typeof timestamp === 'string') {
+            date = new Date(timestamp);
+        } else {
+            return 'N/A';
+        }
+        if (isNaN(date.getTime())) return 'N/A';
+        return date.toLocaleString();
+    } catch (e) {
+        return 'N/A';
+    }
+}
+
+function showEditMetaModal(path, fileType, owner, group, mode) {
+    document.getElementById('editMetaPath').value = path;
+    document.getElementById('editMetaFileType').value = fileType;
+    document.getElementById('editMetaOwner').value = owner;
+    document.getElementById('editMetaGroup').value = group;
+    document.getElementById('editMetaMode').value = mode;
+    
+    new bootstrap.Modal(document.getElementById('editMetaModal')).show();
+}
+</script>
+
+<div class="alert alert-info mt-4">
+    <h6>About Cell Overrides</h6>
+    <p class="mb-0">
+        Override files are cell-specific customizations that replace or supplement 
+        the default deployment files. When a deployment is published to this cell, 
+        these override files will be used by the fleetagent instead of the 
+        default files from the deployment package.
+    </p>
+</div>
+
+{% endblock %}
+

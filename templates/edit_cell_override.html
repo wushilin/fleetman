@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+
+{% block title %}Edit Override: {{ file_path }} - Fleetman{% endblock %}
+
+{% block nav_cells %}active{% endblock %}
+
+{% block content %}
+<div class="mb-3">
+    <a href="/cells/{{ node_id }}/{{ cell_id }}/overrides" class="btn btn-secondary">&larr; Back to Overrides</a>
+</div>
+
+<h1>Edit Override File</h1>
+<p class="text-muted">
+    Cell: <strong>{{ node_id }}/{{ cell_id }}</strong><br>
+    File: <code>{{ file_path }}</code>
+</p>
+
+<form method="post" action="/cells/{{ node_id }}/{{ cell_id }}/overrides/save">
+    <input type="hidden" name="file_path" value="{{ file_path }}">
+    
+    <div class="mb-3">
+        <label for="content" class="form-label">File Content</label>
+        <textarea class="form-control" id="content" name="content" 
+                  rows="20" style="font-family: monospace;">{{ content }}</textarea>
+    </div>
+    
+    <div class="d-flex gap-2">
+        <button type="submit" class="btn btn-primary">Save Changes</button>
+        <a href="/cells/{{ node_id }}/{{ cell_id }}/overrides" class="btn btn-secondary">Cancel</a>
+    </div>
+</form>
+
+<style>
+#content {
+    font-size: 0.9rem;
+    line-height: 1.4;
+}
+</style>
+
+{% endblock %}
+

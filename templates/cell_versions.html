@@ -1,0 +1,68 @@
+{% extends "base.html" %}
+
+{% block title %}Cell Versions: {{ node_id }}/{{ cell_id }} - Fleetman{% endblock %}
+
+{% block nav_cells %}active{% endblock %}
+
+{% block content %}
+<div class="mb-3">
+    <a href="/cells" class="btn btn-secondary">&larr; Back to Cells</a>
+</div>
+
+<h1>Published Versions: <span class="text-primary">{{ node_id }}/{{ cell_id }}</span></h1>
+<p class="text-muted">Bucket: <strong>{{ bucket }}</strong></p>
+
+<div class="card">
+    <div class="card-header">
+        <h5 class="mb-0">Published Versions</h5>
+    </div>
+    <div class="card-body">
+        {% if versions.is_empty() %}
+        <p class="text-muted">No versions have been published to this cell yet.</p>
+        <p>Use the <strong>Publish Deployment</strong> button on the cells page to publish a version.</p>
+        {% else %}
+        <div class="table-responsive">
+            <table class="table table-striped">
+                <thead>
+                    <tr>
+                        <th>Version</th>
+                        <th>Published At</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for version in versions %}
+                    <tr>
+                        <td><code>{{ version.version }}</code></td>
+                        <td>{{ version.published_at }}</td>
+                        <td>
+                            <form method="post" action="/cells/{{ node_id }}/{{ cell_id }}/versions/delete" 
+                                  style="display:inline;">
+                                <input type="hidden" name="version" value="{{ version.version }}">
+                                <button type="submit" class="btn btn-sm btn-danger"
+                                        onclick="return confirm('Are you sure you want to delete version {{ version.version }}? This will permanently remove all files for this version from the cell.');">
+                                    Delete
+                                </button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+    </div>
+</div>
+
+<div class="alert alert-info mt-4">
+    <h6>About Cell Version Management</h6>
+    <p class="mb-0">
+        This page shows all versions that have been published to this cell. 
+        Deleting a version removes all files from the cell's <code>versions/</code> folder for that version.
+        <strong>Note:</strong> This does not affect the original deployment in the deployments section.
+    </p>
+</div>
+
+{% endblock %}
+
+

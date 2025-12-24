@@ -1,0 +1,36 @@
+global:
+  node_id: "node01"                    # Unique identifier for this node
+  check_interval_ms: 30000             # Check for updates every 30 seconds
+  log_directory: "/var/log/fileguard"  # Optional: log to file
+  log_file_prefix: "agent"             # Optional: log file prefix
+  log_rotation: "daily"                # daily, hourly, or never
+  s3_retry_count: 3                    # Number of retry attempts for S3 operations (default: 3)
+  s3_retry_delay_ms: 1000              # Delay between retries in milliseconds (default: 1000)
+
+object_storage:
+  endpoint: "https://oss-cn-hangzhou.aliyuncs.com"
+  access_key: "your-access-key"
+  secret_key: "your-secret-key"
+  bucket: "your-bucket-name"
+  path_style: false                    # Use virtual-hosted-style (true for path-style)
+  prefix: "prod"                       # Required: prefix for all S3 keys (alphanumerics, hyphens, underscores only)
+
+# Supervisor configuration (optional, if using supervisor profile)
+supervisor:
+  conf_d_folder: "/etc/supervisor/conf.d"
+  service_folder: "/opt/services"
+  template_path: "/etc/fileguard/supervisor.conf.template"
+  supervisorctl_path: "/usr/bin/supervisorctl"  # Optional, defaults to /usr/bin/supervisorctl
+
+# Systemd configuration (optional, if using systemd profile)
+systemd:
+  service_folder: "/etc/systemd/system"
+  working_directory: "/opt/services"
+  template_path: "/etc/fileguard/systemd.service.template"
+  systemctl_path: "/usr/bin/systemctl"  # Optional, defaults to /usr/bin/systemctl
+
+# Deploy profile configuration (optional, if using deploy profile for simple file deployment)
+deploy:
+  target_folder: "/opt/deployed"  # Base folder where files will be deployed
+
+

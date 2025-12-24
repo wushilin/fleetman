@@ -1,0 +1,230 @@
+## Example controller config (generated from `controller_config.yaml`)
+## Fill in `buckets.*.access_key` / `buckets.*.secret_key` with real credentials.
+
+buckets:
+  fleetman-oss-sg-prod:
+    bucket_name: fleetman
+    endpoint: https://oss-ap-southeast-1.aliyuncs.com
+    access_key: "YOUR_ACCESS_KEY"
+    secret_key: "YOUR_SECRET_KEY"
+    path_style: false
+    prefix: prod
+manifests:
+  mani-app01:
+    files:
+    - path: run.sh
+      file_type: text
+      owner: root
+      group: root
+      mode: '0700'
+    - path: logs/
+      file_type: folder
+      owner: root
+      group: root
+      mode: '0600'
+    profile: supervisor
+    bucket: fleetman-oss-sg-prod
+    collect_logs: true
+    log_files:
+    - ../a.log
+    max_log_lines: 100
+  rustvpn:
+    files:
+    - path: run.sh
+      file_type: text
+      owner: root
+      group: root
+      mode: '0700'
+    - path: logs/
+      file_type: folder
+      owner: root
+      group: root
+      mode: '0700'
+    - path: server
+      file_type: binary
+      owner: root
+      group: root
+      mode: '0700'
+    - path: client
+      file_type: binary
+      owner: root
+      group: root
+      mode: '0700'
+    - path: tcpserver
+      file_type: binary
+      owner: root
+      group: root
+      mode: '0700'
+    - path: tcpclient
+      file_type: binary
+      owner: root
+      group: root
+      mode: '0700'
+    - path: ca.pem
+      file_type: text
+      owner: root
+      group: root
+      mode: '0600'
+    - path: server.pem
+      file_type: text
+      owner: root
+      group: root
+      mode: '0600'
+    - path: server.key
+      file_type: text
+      owner: root
+      group: root
+      mode: '0600'
+    - path: client.pem
+      file_type: text
+      owner: root
+      group: root
+      mode: '0600'
+    - path: client.key
+      file_type: text
+      owner: root
+      group: root
+      mode: '0600'
+    profile: supervisor
+    bucket: fleetman-oss-sg-prod
+    collect_logs: true
+    log_files:
+    - logs/stdout.log
+    - logs/stderr.log
+    max_log_lines: 30
+  systemd-test:
+    files:
+    - path: run.sh
+      file_type: text
+      owner: root
+      group: root
+      mode: '0700'
+    - path: bin1
+      file_type: binary
+      owner: root
+      group: root
+      mode: '0600'
+    - path: bin2
+      file_type: binary
+      owner: root
+      group: root
+      mode: '0600'
+    profile: systemd
+    bucket: fleetman-oss-sg-prod
+    collect_logs: false
+    log_files: []
+    max_log_lines: 100
+  mariadb:
+    files:
+    - path: run.sh
+      file_type: text
+      owner: root
+      group: root
+      mode: '0700'
+    - path: logs/
+      file_type: folder
+      owner: root
+      group: root
+      mode: '0600'
+    profile: supervisor
+    bucket: fleetman-oss-sg-prod
+    collect_logs: false
+    log_files: []
+    max_log_lines: 100
+  fafafaf:
+    files:
+    - path: run.sh
+      file_type: text
+      owner: root
+      group: root
+      mode: '0700'
+    - path: logs/
+      file_type: folder
+      owner: root
+      group: root
+      mode: '0700'
+    profile: supervisor
+    bucket: fleetman-oss-sg-prod
+    collect_logs: true
+    log_files:
+    - ../fafafaf/logs/stdout.log
+    - logs/stderr.log
+    max_log_lines: 30
+  files01:
+    files:
+    - path: test.txt
+      file_type: text
+      owner: root
+      group: root
+      mode: '0700'
+    profile: deploy
+    bucket: fleetman-oss-sg-prod
+    collect_logs: false
+    log_files:
+    - logs/stdout.log
+    - logs/stderr.log
+    max_log_lines: 30
+cells:
+  baba/systemd-test1:
+    node_id: baba
+    cell_id: systemd-test1
+    bucket: fleetman-oss-sg-prod
+    manifest: systemd-test
+  mercury/systemd-test:
+    node_id: mercury
+    cell_id: systemd-test
+    bucket: fleetman-oss-sg-prod
+    manifest: systemd-test
+  bridge/deployed001test:
+    node_id: bridge
+    cell_id: deployed001test
+    bucket: fleetman-oss-sg-prod
+    manifest: files01
+  baba/rustvpntest:
+    node_id: baba
+    cell_id: rustvpntest
+    bucket: fleetman-oss-sg-prod
+    manifest: rustvpn
+  bridge/systemd-test17:
+    node_id: bridge
+    cell_id: systemd-test17
+    bucket: fleetman-oss-sg-prod
+    manifest: systemd-test
+  mercury/mysql1:
+    node_id: mercury
+    cell_id: mysql1
+    bucket: fleetman-oss-sg-prod
+    manifest: mariadb
+  mama/systemd5553:
+    node_id: mama
+    cell_id: systemd5553
+    bucket: fleetman-oss-sg-prod
+    manifest: systemd-test
+  bridge/app01:
+    node_id: bridge
+    cell_id: app01
+    bucket: fleetman-oss-sg-prod
+    manifest: mani-app01
+  mama/app01new:
+    node_id: mama
+    cell_id: app01new
+    bucket: fleetman-oss-sg-prod
+    manifest: mani-app01
+  mercury/manifest01:
+    node_id: mercury
+    cell_id: manifest01
+    bucket: fleetman-oss-sg-prod
+    manifest: mani-app01
+  baba/app01:
+    node_id: baba
+    cell_id: app01
+    bucket: fleetman-oss-sg-prod
+    manifest: mani-app01
+  mercury/fafafaf:
+    node_id: mercury
+    cell_id: fafafaf
+    bucket: fleetman-oss-sg-prod
+    manifest: fafafaf
+s3_retry_count: 3
+s3_retry_delay_ms: 1000
+

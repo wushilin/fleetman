@@ -1,0 +1,11 @@
+[program:${service_name}]
+command=/opt/services/${cell_id}/run.sh
+stderr_logfile=/opt/services/${cell_id}/logs/stderr.log
+stdout_logfile=/opt/services/${cell_id}/logs/stdout.log
+user=root
+group=root
+directory=/opt/services/${cell_id}
+autostart=true
+autorestart=true
+redirect_stderr=false
+

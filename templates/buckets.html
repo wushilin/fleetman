@@ -1,0 +1,236 @@
+{% extends "base.html" %}
+
+{% block title %}Buckets - Fleetman{% endblock %}
+{% block nav_buckets %}active{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h1>Buckets</h1>
+    <button type="button" class="btn btn-primary" data-bs-toggle="modal" data-bs-target="#addBucketModal">
+        <i class="bi bi-plus-circle"></i> Add Bucket
+    </button>
+</div>
+
+{% if buckets.is_empty() %}
+<div class="alert alert-info">
+    <i class="bi bi-info-circle"></i> No buckets configured yet. Add your first bucket to get started.
+</div>
+{% else %}
+<div class="table-responsive">
+    <table class="table table-hover">
+        <thead>
+            <tr>
+                <th>Display Name</th>
+                <th>Bucket Name</th>
+                <th>Endpoint</th>
+                <th>Access Key</th>
+                <th>Prefix</th>
+                <th>Path Style</th>
+                <th>Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for (display_name, bucket) in buckets %}
+            <tr>
+                <td><strong>{{ display_name }}</strong></td>
+                <td><code>{{ bucket.bucket_name }}</code></td>
+                <td>{{ bucket.endpoint }}</td>
+                <td><code>{{ bucket.access_key }}</code></td>
+                <td>
+                    <code>{{ bucket.prefix }}</code>
+                </td>
+                <td>
+                    {% if bucket.path_style %}
+                    <span class="badge bg-success">Yes</span>
+                    {% else %}
+                    <span class="badge bg-secondary">No</span>
+                    {% endif %}
+                </td>
+                <td>
+                    <form method="post" action="/buckets/delete" style="display: inline;">
+                        <input type="hidden" name="name" value="{{ display_name }}">
+                        <button type="submit" class="btn btn-sm btn-danger" 
+                                onclick="return confirm('Delete bucket {{ display_name }}?');">
+                            <i class="bi bi-trash"></i> Delete
+                        </button>
+                    </form>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endif %}
+
+<!-- Add Bucket Modal -->
+<div class="modal fade" id="addBucketModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <form method="post" action="/buckets/add">
+                <div class="modal-header">
+                    <h5 class="modal-title">Add Bucket</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label">Display Name</label>
+                        <input type="text" class="form-control" name="display_name" id="displayNameInput" required
+                               placeholder="e.g. prod-oss-sg or staging_bucket_01" maxlength="40">
+                        <small class="form-text text-muted">
+                            Friendly name shown in UI. Must be unique.<br>
+                            <strong>Rules:</strong> Max 40 chars, alphanumerics (a-z, A-Z, 0-9), hyphens (-), and underscores (_) only
+                        </small>
+                        <div id="displayNameError" class="invalid-feedback" style="display: none;"></div>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Bucket Name</label>
+                        <input type="text" class="form-control" name="bucket_name" required
+                               placeholder="e.g. my-bucket-name">
+                        <small class="form-text text-muted">
+                            Actual S3 bucket name on the storage service.
+                        </small>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Endpoint URL</label>
+                        <input type="url" class="form-control" name="endpoint" 
+                               placeholder="https://s3.amazonaws.com" required>
+                        <small class="form-text text-muted">S3-compatible endpoint (AWS S3, Alibaba OSS, etc.)</small>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Access Key</label>
+                        <input type="text" class="form-control" name="access_key" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Secret Key</label>
+                        <input type="password" class="form-control" name="secret_key" required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Prefix (Required)</label>
+                        <input type="text" class="form-control" name="prefix" id="prefixInput"
+                               placeholder="e.g. prod or staging_team" required>
+                        <small class="form-text text-muted">
+                            Prepend all paths with this prefix. Useful for sharing a bucket between multiple controllers.<br>
+                            <strong>Rules:</strong> Required, can only contain alphanumerics (a-z, A-Z, 0-9), hyphens (-), and underscores (_)
+                        </small>
+                        <div id="prefixError" class="invalid-feedback" style="display: none;"></div>
+                    </div>
+                    <div class="mb-3 form-check">
+                        <input type="checkbox" class="form-check-input" name="path_style" id="pathStyle" value="true" checked>
+                        <label class="form-check-label" for="pathStyle">
+                            Use Path Style (recommended for non-AWS endpoints)
+                        </label>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Add Bucket</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Client-side validation for display name and prefix
+document.addEventListener('DOMContentLoaded', function() {
+    const displayNameInput = document.getElementById('displayNameInput');
+    const displayNameError = document.getElementById('displayNameError');
+    const prefixInput = document.getElementById('prefixInput');
+    const prefixError = document.getElementById('prefixError');
+    const form = prefixInput.closest('form');
+    
+    function validateDisplayName(name) {
+        if (!name || name.trim() === '') {
+            return { valid: false, message: 'Display name is required and cannot be empty' };
+        }
+        
+        if (name.length > 40) {
+            return { valid: false, message: `Display name must be 40 characters or less (current: ${name.length})` };
+        }
+        
+        // Check that name contains only alphanumerics, hyphens, and underscores
+        const validPattern = /^[a-zA-Z0-9_-]+$/;
+        if (!validPattern.test(name)) {
+            return { valid: false, message: 'Display name can only contain alphanumerics (a-z, A-Z, 0-9), hyphens (-), and underscores (_)' };
+        }
+        
+        return { valid: true, message: '' };
+    }
+    
+    function validatePrefix(prefix) {
+        if (!prefix || prefix.trim() === '') {
+            return { valid: false, message: 'Prefix is required and cannot be empty' };
+        }
+        
+        // Check that prefix contains only alphanumerics, hyphens, and underscores
+        const validPattern = /^[a-zA-Z0-9_-]+$/;
+        if (!validPattern.test(prefix)) {
+            return { valid: false, message: 'Prefix can only contain alphanumerics (a-z, A-Z, 0-9), hyphens (-), and underscores (_)' };
+        }
+        
+        return { valid: true, message: '' };
+    }
+    
+    // Display name validation
+    displayNameInput.addEventListener('input', function() {
+        const result = validateDisplayName(this.value);
+        if (result.valid) {
+            this.classList.remove('is-invalid');
+            this.classList.add('is-valid');
+            displayNameError.style.display = 'none';
+        } else {
+            this.classList.remove('is-valid');
+            this.classList.add('is-invalid');
+            displayNameError.textContent = result.message;
+            displayNameError.style.display = 'block';
+        }
+    });
+    
+    // Prefix validation
+    prefixInput.addEventListener('input', function() {
+        const result = validatePrefix(this.value);
+        if (result.valid) {
+            this.classList.remove('is-invalid');
+            this.classList.add('is-valid');
+            prefixError.style.display = 'none';
+        } else {
+            this.classList.remove('is-valid');
+            this.classList.add('is-invalid');
+            prefixError.textContent = result.message;
+            prefixError.style.display = 'block';
+        }
+    });
+    
+    // Form submission validation
+    form.addEventListener('submit', function(e) {
+        const displayNameResult = validateDisplayName(displayNameInput.value);
+        const prefixResult = validatePrefix(prefixInput.value);
+        
+        let isValid = true;
+        
+        if (!displayNameResult.valid) {
+            isValid = false;
+            displayNameInput.classList.add('is-invalid');
+            displayNameError.textContent = displayNameResult.message;
+            displayNameError.style.display = 'block';
+            alert(displayNameResult.message);
+        }
+        
+        if (!prefixResult.valid) {
+            isValid = false;
+            prefixInput.classList.add('is-invalid');
+            prefixError.textContent = prefixResult.message;
+            prefixError.style.display = 'block';
+            if (isValid) alert(prefixResult.message);  // Only alert if display name was valid
+        }
+        
+        if (!isValid) {
+            e.preventDefault();
+        }
+    });
+});
+</script>
+{% endblock %}
+
