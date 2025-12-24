@@ -12,6 +12,25 @@ Fleetman is a lightweight **controller + agent** system for deploying “cells�
 - **Publishing** creates an immutable per-cell snapshot under `cells/<node>/<cell>/versions/<version>/...` and updates `trigger.json` so agents deploy/redeploy that snapshot.
 - **Agent heartbeat** writes a status JSON periodically to `agents/<node_id>.json` so the controller can show which agents are alive and what they’re running.
 
+## Screenshots
+### Dashboard
+<img width="1721" height="505" alt="image" src="https://github.com/user-attachments/assets/cf3fb51f-b40c-4f94-a5ef-9162ba034f7c" />
+
+### Manifest configuration
+<img width="1724" height="874" alt="image" src="https://github.com/user-attachments/assets/8d1bc8f6-7573-4c2c-9f4c-cba2715e188c" />
+
+### Adding manifest
+<img width="806" height="886" alt="image" src="https://github.com/user-attachments/assets/d746572c-8d78-4139-99a3-a4bf1ef59511" />
+
+### Deployment 
+<img width="1723" height="641" alt="image" src="https://github.com/user-attachments/assets/aa5782f2-421e-43f4-8fe6-8818794fc5ea" />
+
+### Cell management
+<img width="1710" height="704" alt="image" src="https://github.com/user-attachments/assets/1fafe2bd-2167-41ab-aad9-dd4d98be2b3e" />
+
+### Agent status
+<img width="1708" height="698" alt="image" src="https://github.com/user-attachments/assets/207bfffb-886e-4f85-b493-23c062d7aab6" />
+
 ## Binaries
 
 - **Controller**: `fleetman` (web portal + API)
