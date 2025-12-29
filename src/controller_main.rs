@@ -1,4 +1,6 @@
 mod controller_config;
+mod controller_s3;
+mod s3_retry;
 
 use askama::Template;
 use axum::{
@@ -10,9 +12,10 @@ use axum::{
     Form, Router,
 };
 use axum_extra::extract::Multipart;
-use aws_sdk_s3::{config::Builder, config::Credentials, config::Region, primitives::ByteStream, Client};
+use aws_sdk_s3::{primitives::ByteStream, Client};
 use chrono::Local;
 use controller_config::{BucketConfig, CellConfig, ControllerConfig, DeploymentManifest, DeploymentProfile, FileType, ManifestFile};
+use controller_config::ResourceProfile;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -20,108 +23,14 @@ use std::fs;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::time::{sleep, Duration};
+// (tokio::time::{sleep, Duration} were previously used by inline retry logic; now in `s3_retry`.)
 use tower_http::trace::TraceLayer;
 use futures::future::join_all;
 
 type AppState = Arc<RwLock<ControllerConfig>>;
 
-/// Check if an S3 error is retriable (transient error)
-/// Returns true only for transient errors that should be retried
-fn is_retriable_s3_error<E: std::fmt::Debug>(error: &E) -> bool {
-    let error_str = format!("{:?}", error);
-    
-    // Retriable errors (transient):
-    // - Network/timeout errors
-    // - Server errors (5xx)
-    // - Rate limiting (429)
-    
-    // Non-retriable errors (permanent):
-    // - NotFound/NoSuchKey (404)
-    // - AccessDenied (403)
-    // - InvalidRequest (400)
-    
-    if error_str.contains("TimeoutError") || 
-       error_str.contains("DispatchFailure") ||
-       error_str.contains("ConnectorError") ||
-       error_str.contains("ConnectionReset") {
-        return true;  // Network issues - retry
-    }
-    
-    if error_str.contains("NoSuchKey") ||
-       error_str.contains("NotFound") ||
-       error_str.contains("AccessDenied") ||
-       error_str.contains("InvalidRequest") ||
-       error_str.contains("NoSuchBucket") {
-        return false;  // Permanent errors - don't retry
-    }
-    
-    // Check for HTTP status codes in error
-    if error_str.contains("429") || error_str.contains("TooManyRequests") {
-        return true;  // Rate limit - retry
-    }
-    
-    if error_str.contains("500") || error_str.contains("502") || 
-       error_str.contains("503") || error_str.contains("504") ||
-       error_str.contains("InternalError") ||
-       error_str.contains("ServiceUnavailable") {
-        return true;  // Server errors - retry
-    }
-    
-    // Default: don't retry unknown errors
-    false
-}
-
-/// Retry an S3 operation with configurable retry count and delay
-/// Only retries on transient errors (network issues, timeouts, 5xx errors)
-/// Does NOT retry on 404 (NotFound), 403 (Forbidden), or other permanent errors
-async fn retry_s3_operation<F, Fut, T, E>(
-    operation_name: &str,
-    retry_count: u32,
-    retry_delay_ms: u64,
-    mut operation: F,
-) -> Result<T, E>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<T, E>>,
-    E: std::fmt::Debug,
-{
-    let mut attempts = 0;
-    let max_attempts = retry_count.max(1); // At least 1 attempt
-    
-    loop {
-        attempts += 1;
-        
-        match operation().await {
-            Ok(result) => {
-                if attempts > 1 {
-                    println!("✓ S3 operation '{}' succeeded on attempt {}/{}", 
-                             operation_name, attempts, max_attempts);
-                }
-                return Ok(result);
-            }
-            Err(e) => {
-                // Check if error is retriable
-                let retriable = is_retriable_s3_error(&e);
-                
-                if !retriable {
-                    // Non-retriable error (404, 403, etc.) - fail immediately without retry
-                    return Err(e);
-                }
-                
-                if attempts >= max_attempts {
-                    eprintln!("✗ S3 operation '{}' failed after {} attempts: {:?}", 
-                             operation_name, attempts, e);
-                    return Err(e);
-                }
-                
-                eprintln!("⚠ S3 operation '{}' failed on attempt {}/{}: {:?}. Retrying in {}ms...", 
-                         operation_name, attempts, max_attempts, e, retry_delay_ms);
-                sleep(Duration::from_millis(retry_delay_ms)).await;
-            }
-        }
-    }
-}
+use s3_retry::retry_s3_operation;
+use controller_s3::create_s3_client;
 
 const CONFIG_FILE: &str = "controller_config.yaml";
 
@@ -143,6 +52,7 @@ struct BucketsTemplate {
 struct ManifestsTemplate {
     manifests: Vec<(String, DeploymentManifest)>,
     buckets: Vec<(String, BucketConfig)>,
+    resource_profiles: Vec<String>,
 }
 
 #[derive(Template)]
@@ -152,12 +62,55 @@ struct EditManifestTemplate {
     manifest: DeploymentManifest,
     buckets: Vec<(String, BucketConfig)>,
     selected_bucket: String,
+    resource_profiles: Vec<String>,
 }
 
 #[derive(Template)]
 #[template(path = "deployments.html")]
 struct DeploymentsTemplate {
     existing_deployments: Vec<ExistingDeployment>,
+}
+
+#[derive(Template)]
+#[template(path = "cleanup_deployment.html")]
+struct CleanupDeploymentTemplate {
+    orphan_versions: Vec<CleanupOrphanVersionRow>,
+    orphan_manifests_count: usize,
+    orphan_versions_count: usize,
+    orphan_objects_total: usize,
+}
+
+#[derive(Debug, Clone)]
+struct CleanupOrphanVersionRow {
+    bucket_display: String,
+    manifest_name: String,
+    version: String,
+    object_count: usize,
+}
+
+#[derive(Template)]
+#[template(path = "recycle_bin.html")]
+struct RecycleBinTemplate {
+    entries: Vec<RecycleEntryDisplay>,
+    total_objects: usize,
+}
+
+#[derive(Template)]
+#[template(path = "recycle_clear.html")]
+struct RecycleClearTemplate {
+    entries: Vec<RecycleEntryDisplay>,
+    total_objects: usize,
+}
+
+#[derive(Debug, Clone)]
+struct RecycleEntryDisplay {
+    bucket_display: String,
+    recycle_prefix_base: String, // without bucket prefix
+    manifest_name: String,
+    version: String,
+    deleted_at_raw: String,
+    deleted_at_display: String,
+    object_count: usize,
 }
 
 #[derive(Template)]
@@ -202,6 +155,351 @@ struct EditFileTemplate {
 #[template(path = "agents.html")]
 struct AgentsTemplate {
     agents: Vec<AgentDisplay>,
+}
+
+#[derive(Template)]
+#[template(path = "resource_profiles.html")]
+#[allow(dead_code)]
+struct ResourceProfilesTemplate {
+    profiles: Vec<ResourceProfileDisplay>,
+    add_form: AddResourceProfileFormValues,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ResourceProfileDisplay {
+    name: String,
+    cpu_display: String,
+    memory_display: String,
+    memory_swap_display: String,
+    io_weight_display: String,
+    editable: bool,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct AddResourceProfileFormValues {
+    name: String,
+    cpu: String,
+    memory: String,
+    memory_swap: String,
+    io_weight: String,
+}
+
+const BUILTIN_PROFILE_UNLIMITED: &str = "unlimited";
+
+fn builtin_unlimited_profile() -> ResourceProfile {
+    ResourceProfile {
+        cpu: None,
+        memory: None,
+        memory_swap: None,
+        io_weight: Some(100),
+    }
+}
+
+const MIN_RAM_BYTES: u64 = 5 * 1024 * 1024;
+
+#[derive(Template)]
+#[template(path = "systemd.service.template", escape = "none")]
+struct SystemdServiceUnitTemplate {
+    // Emit agent-owned placeholders verbatim; Fleetman must not assume it knows the agent's
+    // cell folder mapping.
+    fleetagent_cell_id: String,
+    fleetagent_service_working_dir: String,
+    // Fleetman-owned run-as identity.
+    service_user: String,
+    service_group: String,
+    cpu_quota: Option<String>,     // e.g. "50%"
+    memory_max: Option<String>,    // e.g. "2G"
+    memory_swap_max: Option<String>, // e.g. "2G" or "0"
+    io_weight: Option<u32>,
+}
+
+#[derive(Template)]
+#[template(path = "pm.service.yml.template", escape = "none")]
+#[allow(dead_code)]
+struct ProcessMasterServiceTemplate {
+    fleetagent_cell_id: String,
+    fleetagent_service_working_dir: String,
+    service_user: String,
+    service_group: String,
+    cpu: Option<String>,
+    memory: Option<String>,
+    memory_swap: Option<String>,
+    io_weight: Option<u32>,
+}
+
+#[derive(Template)]
+#[template(path = "run.sh.template", escape = "none")]
+struct RunShTemplate {
+    my_program: String,
+}
+
+fn resource_profile_names(config: &ControllerConfig) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    out.push(BUILTIN_PROFILE_UNLIMITED.to_string());
+    let mut keys: Vec<String> = config.resource_profiles.keys().cloned().collect();
+    keys.sort();
+    out.extend(keys);
+    out
+}
+
+fn resource_profile_exists(config: &ControllerConfig, name: &str) -> bool {
+    let n = name.trim();
+    if n.is_empty() {
+        return false;
+    }
+    n == BUILTIN_PROFILE_UNLIMITED || config.resource_profiles.contains_key(n)
+}
+
+fn required_service_file_and_kind(profile: &DeploymentProfile) -> Option<(&'static str, &'static str)> {
+    match profile {
+        DeploymentProfile::Systemd => Some(("systemd", "app.service")),
+        DeploymentProfile::ProcessMaster => Some(("processmaster", "service.yml")),
+        _ => None,
+    }
+}
+
+fn parse_mode_octal(mode: &str) -> Result<u32, String> {
+    let t = mode.trim();
+    if t.is_empty() {
+        return Err("mode is empty".to_string());
+    }
+    u32::from_str_radix(t, 8).map_err(|_| {
+        format!(
+            "Invalid mode: {}. Mode must be an octal number (e.g., 0700, 0755).",
+            mode
+        )
+    })
+}
+
+fn default_override_mode(path: &str, file_type: &FileType) -> &'static str {
+    let is_folder = matches!(file_type, FileType::Folder) || path.ends_with('/');
+    let is_run_sh = path == "run.sh" || path.ends_with("/run.sh");
+    if is_folder || is_run_sh {
+        "0700"
+    } else {
+        "0600"
+    }
+}
+
+fn validate_run_sh(files: &[ManifestFile], profile: &DeploymentProfile) -> Result<(), String> {
+    // For systemd/processmaster (and legacy supervisor), require run.sh as a text file with mode >= 0700 and owner execute bit.
+    let require = matches!(
+        profile,
+        DeploymentProfile::Systemd | DeploymentProfile::ProcessMaster | DeploymentProfile::Supervisor
+    );
+    if !require {
+        return Ok(());
+    }
+
+    let Some(f) = files.iter().find(|f| f.path == "run.sh") else {
+        return Err(format!("run.sh is required for {} profile.", profile));
+    };
+    if f.file_type != FileType::Text {
+        return Err("run.sh must be a text file.".to_string());
+    }
+    // Mode is optional. If not specified, the agent defaults run.sh to 0700.
+    if let Some(mstr) = f.mode.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let mode = parse_mode_octal(mstr)?;
+        if (mode & 0o100) == 0 {
+            return Err(format!(
+                "run.sh must be executable (owner execute bit). Current mode: {}. Suggested: 0700, 0750, or 0755.",
+                mstr
+            ));
+        }
+        if mode < 0o700 {
+            return Err(format!(
+                "run.sh must have at least 0700 permission. Current mode: {}. Suggested: 0700, 0750, or 0755.",
+                mstr
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_logs_folder(files: &[ManifestFile], profile: &DeploymentProfile) -> Result<(), String> {
+    let require = matches!(profile, DeploymentProfile::Systemd | DeploymentProfile::ProcessMaster);
+    if !require {
+        return Ok(());
+    }
+    let Some(f) = files.iter().find(|f| f.path == "logs/") else {
+        return Err("logs/ folder is required for systemd/processmaster profiles.".to_string());
+    };
+    if f.file_type != FileType::Folder {
+        return Err("logs/ must be a folder entry (path should end with '/').".to_string());
+    }
+    Ok(())
+}
+
+fn validate_service_folder_meta(mode: &str) -> Result<(), String> {
+    let m = parse_mode_octal(mode)?;
+    if m < 0o700 {
+        return Err(format!(
+            "service_folder_mode must be at least 0700. Current: {}",
+            mode
+        ));
+    }
+    Ok(())
+}
+
+fn validate_service_identity(owner: &str, group: &str) -> Result<(), String> {
+    let owner_t = owner.trim();
+    if owner_t.is_empty() {
+        return Err("service_owner cannot be empty".to_string());
+    }
+    if owner_t.contains(|c: char| c.is_whitespace()) {
+        return Err("service_owner cannot contain whitespace".to_string());
+    }
+    let group_t = group.trim();
+    if group_t.is_empty() {
+        return Err("service_group cannot be empty".to_string());
+    }
+    if group_t.contains(|c: char| c.is_whitespace()) {
+        return Err("service_group cannot contain whitespace".to_string());
+    }
+    Ok(())
+}
+
+fn validate_optional_owner_group(field: &str, v: &Option<String>) -> Result<(), String> {
+    let Some(s) = v.as_deref().map(|x| x.trim()).filter(|x| !x.is_empty()) else {
+        return Ok(());
+    };
+    if s.contains(|c: char| c.is_whitespace()) {
+        return Err(format!("{} cannot contain whitespace", field));
+    }
+    Ok(())
+}
+
+fn parse_cpu_millis(s: &str) -> Result<Option<u32>, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let lower = t.to_ascii_lowercase();
+    if !lower.ends_with('m') {
+        return Err("cpu must be in the form NNNm (e.g. 200m)".to_string());
+    }
+    let num_str = lower.trim_end_matches('m');
+    let n: u32 = num_str
+        .parse()
+        .map_err(|_| "cpu must be in the form NNNm (e.g. 200m)".to_string())?;
+    if n < 100 {
+        return Err("cpu must be at least 100m".to_string());
+    }
+    Ok(Some(n))
+}
+
+fn parse_bytes(s: &str) -> Result<Option<u64>, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    // No spaces allowed between number and unit (e.g. "512MiB" ok, "512 MiB" rejected).
+    let re = Regex::new(r"^([0-9]+)([A-Za-z]*)$").map_err(|e| e.to_string())?;
+    let caps = re
+        .captures(t)
+        .ok_or_else(|| "invalid size (expected: <number><unit>, e.g. 512MiB, 2G, 200K, 0b)".to_string())?;
+    let num: u64 = caps
+        .get(1)
+        .unwrap()
+        .as_str()
+        .parse()
+        .map_err(|_| "invalid number in size".to_string())?;
+    let mut unit = caps.get(2).unwrap().as_str().to_ascii_lowercase();
+    if unit.ends_with('b') {
+        unit.pop();
+    }
+    let mult: u64 = match unit.as_str() {
+        "" => 1,
+        "k" => 1_000,
+        "m" => 1_000_000,
+        "g" => 1_000_000_000,
+        "ki" => 1024,
+        "mi" => 1024 * 1024,
+        "gi" => 1024 * 1024 * 1024,
+        _ => {
+            return Err(
+                "invalid unit (allowed: k,m,g,ki,mi,gi with optional 'B' suffix; e.g. 512MiB, 2G, 200K, 0b)"
+                    .to_string(),
+            )
+        }
+    };
+    Ok(Some(
+        num.checked_mul(mult)
+            .ok_or_else(|| "size is too large".to_string())?,
+    ))
+}
+
+fn format_systemd_bytes(bytes: u64) -> String {
+    // Prefer 1024-based K/M/G suffixes when divisible, else raw bytes.
+    const K: u64 = 1024;
+    const M: u64 = 1024 * 1024;
+    const G: u64 = 1024 * 1024 * 1024;
+    if bytes == 0 {
+        return "0".to_string();
+    }
+    if bytes % G == 0 {
+        return format!("{}G", bytes / G);
+    }
+    if bytes % M == 0 {
+        return format!("{}M", bytes / M);
+    }
+    if bytes % K == 0 {
+        return format!("{}K", bytes / K);
+    }
+    bytes.to_string()
+}
+
+fn format_cpu_quota_percent(millis: u32) -> String {
+    // 1000m == 100% of one core.
+    let pct10: u32 = millis;
+    let int_part = pct10 / 10;
+    let frac = pct10 % 10;
+    if frac == 0 {
+        format!("{}%", int_part)
+    } else {
+        format!("{}.{}%", int_part, frac)
+    }
+}
+
+fn validate_and_normalize_resource_profile(
+    cpu_in: &str,
+    ram_in: &str,
+    swap_in: &str,
+    io_weight_in: &str,
+) -> Result<(Option<String>, Option<String>, Option<String>, Option<u32>, Option<u32>, Option<u64>, Option<u64>), String> {
+    // returns: (cpu_str, ram_str, swap_str, io_weight, cpu_millis, ram_bytes, swap_bytes)
+    let cpu_millis = parse_cpu_millis(cpu_in)?;
+    let cpu = cpu_millis.map(|m| format!("{}m", m));
+
+    let ram_bytes = parse_bytes(ram_in)?;
+    if let Some(b) = ram_bytes {
+        if b < MIN_RAM_BYTES {
+            return Err(format!(
+                "ram must be at least 5MiB ({} bytes); got {} bytes",
+                MIN_RAM_BYTES, b
+            ));
+        }
+    }
+    let ram = normalize_opt_string(ram_in);
+
+    // swap defaults to 0b (unless user specifies), and has no minimum.
+    let swap_bytes = if swap_in.trim().is_empty() {
+        Some(0)
+    } else {
+        parse_bytes(swap_in)?
+    };
+    let swap = Some("0b".to_string()).filter(|_| swap_in.trim().is_empty()).or_else(|| normalize_opt_string(swap_in));
+
+    let io_weight = parse_opt_u32(io_weight_in)?;
+    if let Some(w) = io_weight {
+        if !(1..=10000).contains(&w) {
+            return Err("io_weight must be in 1..=10000".to_string());
+        }
+    }
+
+    Ok((cpu, ram, swap, io_weight, cpu_millis, ram_bytes, swap_bytes))
 }
 
 #[allow(dead_code)] // fields are used by Askama templates via macro-generated code
@@ -283,6 +581,16 @@ struct UpdateManifestForm {
     original_name: String,
     name: String,
     profile: String,
+    #[serde(default)]
+    resource_profile: Option<String>,
+    service_owner: String,
+    service_group: String,
+    #[serde(default)]
+    service_folder_mode: Option<String>,
+    #[serde(default)]
+    service_folder_owner: Option<String>,
+    #[serde(default)]
+    service_folder_group: Option<String>,
     bucket: String,
     files: String,
     file_types: String,
@@ -301,6 +609,16 @@ struct UpdateManifestForm {
 struct ManifestForm {
     name: String,
     profile: String,
+    #[serde(default)]
+    resource_profile: Option<String>,
+    service_owner: String,
+    service_group: String,
+    #[serde(default)]
+    service_folder_mode: Option<String>,
+    #[serde(default)]
+    service_folder_owner: Option<String>,
+    #[serde(default)]
+    service_folder_group: Option<String>,
     bucket: String,
     files: String,
     file_types: String,
@@ -374,6 +692,11 @@ async fn main() {
         .route("/buckets", get(buckets_page))
         .route("/buckets/add", post(add_bucket))
         .route("/buckets/delete", post(delete_bucket))
+        .route("/resource-profiles", get(resource_profiles_page))
+        .route("/resource-profiles/add", post(add_resource_profile))
+        .route("/resource-profiles/edit", get(edit_resource_profile_page))
+        .route("/resource-profiles/update", post(update_resource_profile))
+        .route("/resource-profiles/delete", post(delete_resource_profile))
         .route("/manifests", get(manifests_page))
         .route("/manifests/add", post(add_manifest))
         .route("/manifests/edit", get(edit_manifest_page))
@@ -404,8 +727,14 @@ async fn main() {
         .route("/deployments/download", get(download_file))
         .route("/deployments/files", get(list_files))
         .route("/deployments/file-status", get(get_file_status))
+        .route("/deployments/generate-service-file", post(generate_service_file))
         .route("/deployments/delete", post(delete_file))
         .route("/deployments/delete_version", post(delete_version))
+        .route("/deployments/cleanup", get(deployments_cleanup_preview).post(deployments_cleanup_execute))
+        .route("/deployments/recycle", get(recycle_bin_page))
+        .route("/deployments/recycle/restore", post(recycle_restore))
+        .route("/deployments/recycle/delete", post(recycle_delete_permanently))
+        .route("/deployments/recycle/clear", get(recycle_clear_preview).post(recycle_clear_execute))
         .route("/deployments/finish", post(finish_deployment))
         .route("/deployments/bulk-publish", post(bulk_publish_deployment))
         .route("/deployments/staging/browse", get(browse_staging))
@@ -413,6 +742,7 @@ async fn main() {
         .route("/api/manifest-versions", get(get_manifest_versions))
         .route("/api/app-versions", get(get_app_versions))
         .route("/api/app-cells", get(get_app_cells))
+        .route("/api/service-template", get(api_service_template))
         .route("/api/cell-version-exists", get(api_cell_version_exists))
         .route("/api/cell-versions-exist", get(api_cell_versions_exist))
         .layer(TraceLayer::new_for_http())
@@ -455,6 +785,401 @@ async fn dashboard(AxumState(state): AxumState<AppState>) -> impl IntoResponse {
 struct DeleteAgentForm {
     bucket: String, // bucket DISPLAY name (key in controller config)
     node_id: String,
+}
+
+#[derive(Deserialize)]
+struct AddResourceProfileForm {
+    name: String,
+    #[serde(default)]
+    cpu: String,
+    #[serde(default)]
+    memory: String,
+    #[serde(default)]
+    memory_swap: String,
+    #[serde(default)]
+    io_weight: String,
+}
+
+#[derive(Deserialize)]
+struct EditResourceProfileQuery {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct UpdateResourceProfileForm {
+    name: String,
+    #[serde(default)]
+    cpu: String,
+    #[serde(default)]
+    memory: String,
+    #[serde(default)]
+    memory_swap: String,
+    #[serde(default)]
+    io_weight: String,
+}
+
+#[derive(Deserialize)]
+struct DeleteResourceProfileForm {
+    name: String,
+}
+
+fn normalize_opt_string(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+fn parse_opt_u32(s: &str) -> Result<Option<u32>, String> {
+    let t = s.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let v: u32 = t.parse().map_err(|_| format!("Invalid number: {}", t))?;
+    Ok(Some(v))
+}
+
+fn profile_display_value(s: &Option<String>) -> String {
+    s.clone().unwrap_or_else(|| "unlimited".to_string())
+}
+
+fn profile_display_u32(v: &Option<u32>, default_if_none: Option<u32>) -> String {
+    match (v, default_if_none) {
+        (Some(x), _) => x.to_string(),
+        (None, Some(d)) => d.to_string(),
+        (None, None) => "unlimited".to_string(),
+    }
+}
+
+async fn resource_profiles_page(AxumState(state): AxumState<AppState>) -> impl IntoResponse {
+    let mut profiles: Vec<ResourceProfileDisplay> = Vec::new();
+
+    // Built-in unlimited (not editable).
+    let unlimited = builtin_unlimited_profile();
+    profiles.push(ResourceProfileDisplay {
+        name: BUILTIN_PROFILE_UNLIMITED.to_string(),
+        cpu_display: profile_display_value(&unlimited.cpu),
+        memory_display: profile_display_value(&unlimited.memory),
+        memory_swap_display: profile_display_value(&unlimited.memory_swap),
+        io_weight_display: profile_display_u32(&unlimited.io_weight, Some(100)),
+        editable: false,
+    });
+
+    // User-defined.
+    {
+        let cfg = state.read().unwrap();
+        let mut keys: Vec<_> = cfg.resource_profiles.keys().cloned().collect();
+        keys.sort();
+        for k in keys {
+            if let Some(p) = cfg.resource_profiles.get(&k) {
+                profiles.push(ResourceProfileDisplay {
+                    name: k,
+                    cpu_display: profile_display_value(&p.cpu),
+                    memory_display: profile_display_value(&p.memory),
+                    memory_swap_display: profile_display_value(&p.memory_swap),
+                    io_weight_display: profile_display_u32(&p.io_weight, None),
+                    editable: true,
+                });
+            }
+        }
+    }
+
+    HtmlTemplate(ResourceProfilesTemplate {
+        profiles,
+        add_form: AddResourceProfileFormValues {
+            name: "".to_string(),
+            cpu: "".to_string(),
+            memory: "".to_string(),
+            memory_swap: "".to_string(),
+            io_weight: "".to_string(),
+        },
+        error: None,
+    })
+}
+
+async fn add_resource_profile(
+    AxumState(state): AxumState<AppState>,
+    Form(form): Form<AddResourceProfileForm>,
+) -> impl IntoResponse {
+    let name = form.name.trim().to_string();
+    if let Err(e) = validate_display_name(&name) {
+        let mut profiles: Vec<ResourceProfileDisplay> = Vec::new();
+        let unlimited = builtin_unlimited_profile();
+        profiles.push(ResourceProfileDisplay {
+            name: BUILTIN_PROFILE_UNLIMITED.to_string(),
+            cpu_display: profile_display_value(&unlimited.cpu),
+            memory_display: profile_display_value(&unlimited.memory),
+            memory_swap_display: profile_display_value(&unlimited.memory_swap),
+            io_weight_display: profile_display_u32(&unlimited.io_weight, Some(100)),
+            editable: false,
+        });
+        {
+            let cfg = state.read().unwrap();
+            let mut keys: Vec<_> = cfg.resource_profiles.keys().cloned().collect();
+            keys.sort();
+            for k in keys {
+                if let Some(p) = cfg.resource_profiles.get(&k) {
+                    profiles.push(ResourceProfileDisplay {
+                        name: k,
+                        cpu_display: profile_display_value(&p.cpu),
+                        memory_display: profile_display_value(&p.memory),
+                        memory_swap_display: profile_display_value(&p.memory_swap),
+                        io_weight_display: profile_display_u32(&p.io_weight, None),
+                        editable: true,
+                    });
+                }
+            }
+        }
+        return HtmlTemplate(ResourceProfilesTemplate {
+            profiles,
+            add_form: AddResourceProfileFormValues {
+                name: form.name.clone(),
+                cpu: form.cpu.clone(),
+                memory: form.memory.clone(),
+                memory_swap: form.memory_swap.clone(),
+                io_weight: form.io_weight.clone(),
+            },
+            error: Some(format!("Invalid profile name: {}", e)),
+        })
+        .into_response();
+    }
+    if name == BUILTIN_PROFILE_UNLIMITED {
+        let mut profiles: Vec<ResourceProfileDisplay> = Vec::new();
+        let unlimited = builtin_unlimited_profile();
+        profiles.push(ResourceProfileDisplay {
+            name: BUILTIN_PROFILE_UNLIMITED.to_string(),
+            cpu_display: profile_display_value(&unlimited.cpu),
+            memory_display: profile_display_value(&unlimited.memory),
+            memory_swap_display: profile_display_value(&unlimited.memory_swap),
+            io_weight_display: profile_display_u32(&unlimited.io_weight, Some(100)),
+            editable: false,
+        });
+        {
+            let cfg = state.read().unwrap();
+            let mut keys: Vec<_> = cfg.resource_profiles.keys().cloned().collect();
+            keys.sort();
+            for k in keys {
+                if let Some(p) = cfg.resource_profiles.get(&k) {
+                    profiles.push(ResourceProfileDisplay {
+                        name: k,
+                        cpu_display: profile_display_value(&p.cpu),
+                        memory_display: profile_display_value(&p.memory),
+                        memory_swap_display: profile_display_value(&p.memory_swap),
+                        io_weight_display: profile_display_u32(&p.io_weight, None),
+                        editable: true,
+                    });
+                }
+            }
+        }
+        return HtmlTemplate(ResourceProfilesTemplate {
+            profiles,
+            add_form: AddResourceProfileFormValues {
+                name: form.name.clone(),
+                cpu: form.cpu.clone(),
+                memory: form.memory.clone(),
+                memory_swap: form.memory_swap.clone(),
+                io_weight: form.io_weight.clone(),
+            },
+            error: Some("Profile name 'unlimited' is reserved".to_string()),
+        })
+        .into_response();
+    }
+
+    let (cpu, ram, swap, io_weight, _cpu_millis, _ram_bytes, _swap_bytes) = match validate_and_normalize_resource_profile(
+        &form.cpu,
+        &form.memory,
+        &form.memory_swap,
+        &form.io_weight,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            let mut profiles: Vec<ResourceProfileDisplay> = Vec::new();
+            let unlimited = builtin_unlimited_profile();
+            profiles.push(ResourceProfileDisplay {
+                name: BUILTIN_PROFILE_UNLIMITED.to_string(),
+                cpu_display: profile_display_value(&unlimited.cpu),
+                memory_display: profile_display_value(&unlimited.memory),
+                memory_swap_display: profile_display_value(&unlimited.memory_swap),
+                io_weight_display: profile_display_u32(&unlimited.io_weight, Some(100)),
+                editable: false,
+            });
+            {
+                let cfg = state.read().unwrap();
+                let mut keys: Vec<_> = cfg.resource_profiles.keys().cloned().collect();
+                keys.sort();
+                for k in keys {
+                    if let Some(p) = cfg.resource_profiles.get(&k) {
+                        profiles.push(ResourceProfileDisplay {
+                            name: k,
+                            cpu_display: profile_display_value(&p.cpu),
+                            memory_display: profile_display_value(&p.memory),
+                            memory_swap_display: profile_display_value(&p.memory_swap),
+                            io_weight_display: profile_display_u32(&p.io_weight, None),
+                            editable: true,
+                        });
+                    }
+                }
+            }
+            return HtmlTemplate(ResourceProfilesTemplate {
+                profiles,
+                add_form: AddResourceProfileFormValues {
+                    name: form.name.clone(),
+                    cpu: form.cpu.clone(),
+                    memory: form.memory.clone(),
+                    memory_swap: form.memory_swap.clone(),
+                    io_weight: form.io_weight.clone(),
+                },
+                error: Some(format!("Invalid resource profile: {}", e)),
+            })
+            .into_response();
+        }
+    };
+
+    let profile = ResourceProfile { cpu, memory: ram, memory_swap: swap, io_weight };
+
+    {
+        let mut cfg = state.write().unwrap();
+        if cfg.resource_profiles.contains_key(&name) {
+            let mut profiles: Vec<ResourceProfileDisplay> = Vec::new();
+            let unlimited = builtin_unlimited_profile();
+            profiles.push(ResourceProfileDisplay {
+                name: BUILTIN_PROFILE_UNLIMITED.to_string(),
+                cpu_display: profile_display_value(&unlimited.cpu),
+                memory_display: profile_display_value(&unlimited.memory),
+                memory_swap_display: profile_display_value(&unlimited.memory_swap),
+                io_weight_display: profile_display_u32(&unlimited.io_weight, Some(100)),
+                editable: false,
+            });
+            let mut keys: Vec<_> = cfg.resource_profiles.keys().cloned().collect();
+            keys.sort();
+            for k in keys {
+                if let Some(p) = cfg.resource_profiles.get(&k) {
+                    profiles.push(ResourceProfileDisplay {
+                        name: k,
+                        cpu_display: profile_display_value(&p.cpu),
+                        memory_display: profile_display_value(&p.memory),
+                        memory_swap_display: profile_display_value(&p.memory_swap),
+                        io_weight_display: profile_display_u32(&p.io_weight, None),
+                        editable: true,
+                    });
+                }
+            }
+            return HtmlTemplate(ResourceProfilesTemplate {
+                profiles,
+                add_form: AddResourceProfileFormValues {
+                    name: form.name.clone(),
+                    cpu: form.cpu.clone(),
+                    memory: form.memory.clone(),
+                    memory_swap: form.memory_swap.clone(),
+                    io_weight: form.io_weight.clone(),
+                },
+                error: Some(format!("Duplicate resource profile name: {}", name)),
+            })
+            .into_response();
+        }
+        cfg.resource_profiles.insert(name.clone(), profile);
+        save_config(&cfg).ok();
+    }
+
+    Redirect::to("/resource-profiles").into_response()
+}
+
+#[derive(Template)]
+#[template(path = "edit_resource_profile.html")]
+#[allow(dead_code)]
+struct EditResourceProfileTemplate {
+    name: String,
+    cpu: String,
+    memory: String,
+    memory_swap: String,
+    io_weight: String,
+    error: Option<String>,
+}
+
+async fn edit_resource_profile_page(
+    AxumState(state): AxumState<AppState>,
+    Query(q): Query<EditResourceProfileQuery>,
+) -> Response {
+    let name = q.name.trim().to_string();
+    if name == BUILTIN_PROFILE_UNLIMITED {
+        return Redirect::to("/resource-profiles").into_response();
+    }
+
+    let cfg = state.read().unwrap();
+    let Some(p) = cfg.resource_profiles.get(&name) else {
+        return Redirect::to("/resource-profiles").into_response();
+    };
+
+    HtmlTemplate(EditResourceProfileTemplate {
+        name,
+        cpu: p.cpu.clone().unwrap_or_default(),
+        memory: p.memory.clone().unwrap_or_default(),
+        memory_swap: p.memory_swap.clone().unwrap_or_default(),
+        io_weight: p.io_weight.map(|x| x.to_string()).unwrap_or_default(),
+        error: None,
+    })
+    .into_response()
+}
+
+async fn update_resource_profile(
+    AxumState(state): AxumState<AppState>,
+    Form(form): Form<UpdateResourceProfileForm>,
+) -> impl IntoResponse {
+    let name = form.name.trim().to_string();
+    if name == BUILTIN_PROFILE_UNLIMITED {
+        return Redirect::to("/resource-profiles").into_response();
+    }
+
+    let (cpu, ram, swap, io_weight, _cpu_millis, _ram_bytes, _swap_bytes) = match validate_and_normalize_resource_profile(
+        &form.cpu,
+        &form.memory,
+        &form.memory_swap,
+        &form.io_weight,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return HtmlTemplate(EditResourceProfileTemplate {
+                name: name.clone(),
+                cpu: form.cpu.clone(),
+                memory: form.memory.clone(),
+                memory_swap: form.memory_swap.clone(),
+                io_weight: form.io_weight.clone(),
+                error: Some(e),
+            })
+            .into_response();
+        }
+    };
+
+    let profile = ResourceProfile { cpu, memory: ram, memory_swap: swap, io_weight };
+
+    {
+        let mut cfg = state.write().unwrap();
+        if !cfg.resource_profiles.contains_key(&name) {
+            return Redirect::to("/resource-profiles").into_response();
+        }
+        cfg.resource_profiles.insert(name.clone(), profile);
+        save_config(&cfg).ok();
+    }
+
+    Redirect::to("/resource-profiles").into_response()
+}
+
+async fn delete_resource_profile(
+    AxumState(state): AxumState<AppState>,
+    Form(form): Form<DeleteResourceProfileForm>,
+) -> impl IntoResponse {
+    let name = form.name.trim().to_string();
+    if name == BUILTIN_PROFILE_UNLIMITED {
+        return Redirect::to("/resource-profiles").into_response();
+    }
+    {
+        let mut cfg = state.write().unwrap();
+        cfg.resource_profiles.remove(&name);
+        save_config(&cfg).ok();
+    }
+    Redirect::to("/resource-profiles").into_response()
 }
 
 async fn agents_page(AxumState(state): AxumState<AppState>) -> impl IntoResponse {
@@ -787,7 +1512,12 @@ async fn manifests_page(AxumState(state): AxumState<AppState>) -> impl IntoRespo
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     
-    let template = ManifestsTemplate { manifests, buckets };
+    let resource_profiles = resource_profile_names(&config);
+    let template = ManifestsTemplate {
+        manifests,
+        buckets,
+        resource_profiles,
+    };
     HtmlTemplate(template)
 }
 
@@ -809,25 +1539,167 @@ async fn add_manifest(
         .filter(|s| !s.is_empty())
         .collect();
     
-    let owners: Vec<String> = form.owners
+    let service_owner = form.service_owner.trim().to_string();
+    let service_group = form.service_group.trim().to_string();
+    if let Err(e) = validate_service_identity(&service_owner, &service_group) {
+        return Html(format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p>{}</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+            e
+        ))
+        .into_response();
+    }
+
+    let service_folder_mode = form
+        .service_folder_mode
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("0700")
+        .to_string();
+    if let Err(e) = validate_service_folder_meta(&service_folder_mode) {
+        return Html(format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p>{}</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+            e
+        ))
+        .into_response();
+    }
+
+    let service_folder_owner = form
+        .service_folder_owner
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let service_folder_group = form
+        .service_folder_group
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    // Either set both, or set neither.
+    if service_folder_owner.is_some() ^ service_folder_group.is_some() {
+        return Html(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p>Service folder ownership override must include both owner and group (user:group).</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#
+            .to_string(),
+        )
+        .into_response();
+    }
+    // If override equals the default (service_owner/service_group), drop it so it doesn't "stick"
+    // and block future changes to service_owner/service_group.
+    let (service_folder_owner, service_folder_group) =
+        match (&service_folder_owner, &service_folder_group) {
+            (Some(o), Some(g)) if o == &service_owner && g == &service_group => (None, None),
+            _ => (service_folder_owner, service_folder_group),
+        };
+    if let Err(e) = validate_optional_owner_group("service_folder_owner", &service_folder_owner) {
+        return Html(format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p>{}</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+            e
+        ))
+        .into_response();
+    }
+    if let Err(e) = validate_optional_owner_group("service_folder_group", &service_folder_group) {
+        return Html(format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p>{}</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+            e
+        ))
+        .into_response();
+    }
+
+    let owners: Vec<Option<String>> = form.owners
         .lines()
         .map(|s| s.trim().to_string())
-        .map(|s| if s.is_empty() { "root".to_string() } else { s })
+        .map(|s| if s.is_empty() { None } else { Some(s) })
         .collect();
     
-    let groups: Vec<String> = form.groups
+    let groups: Vec<Option<String>> = form.groups
         .lines()
         .map(|s| s.trim().to_string())
-        .map(|s| if s.is_empty() { "root".to_string() } else { s })
+        .map(|s| if s.is_empty() { None } else { Some(s) })
         .collect();
     
-    let modes: Vec<String> = form.modes
+    let modes: Vec<Option<String>> = form.modes
         .lines()
         .map(|s| s.trim().to_string())
-        .map(|s| if s.is_empty() { "0600".to_string() } else { s })
+        .map(|s| if s.is_empty() { None } else { Some(s) })
         .collect();
     
-    let mut files: Vec<ManifestFile> = file_paths.iter()
+    let files: Vec<ManifestFile> = file_paths.iter()
         .zip(file_types.iter())
         .enumerate()
         .map(|(i, (path, ftype))| ManifestFile {
@@ -837,18 +1709,11 @@ async fn add_manifest(
                 "folder" => FileType::Folder,
                 _ => FileType::Binary,
             },
-            owner: owners.get(i).cloned().unwrap_or_else(|| "root".to_string()),
-            group: groups.get(i).cloned().unwrap_or_else(|| "root".to_string()),
-            mode: modes.get(i).cloned().unwrap_or_else(|| "0600".to_string()),
+            owner: owners.get(i).cloned().unwrap_or(None),
+            group: groups.get(i).cloned().unwrap_or(None),
+            mode: modes.get(i).cloned().unwrap_or(None),
         })
         .collect();
-    
-    // Auto-set mode to 0700 for shell scripts (.sh, .bash)
-    for file in &mut files {
-        if file.path.ends_with(".sh") || file.path.ends_with(".bash") {
-            file.mode = "0700".to_string();
-        }
-    }
     
     // Validate file paths (applies to all profiles)
     for file in &files {
@@ -888,8 +1753,166 @@ async fn add_manifest(
     let profile = match form.profile.to_lowercase().as_str() {
         "supervisor" => DeploymentProfile::Supervisor,
         "systemd" => DeploymentProfile::Systemd,
+        "processmaster" => DeploymentProfile::ProcessMaster,
         "deploy" => DeploymentProfile::Deploy,
         _ => DeploymentProfile::Systemd,
+    };
+
+    if let Err(e) = validate_run_sh(&files, &profile) {
+        return Html(format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p>{}</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+            e
+        ))
+        .into_response();
+    }
+    if let Err(e) = validate_logs_folder(&files, &profile) {
+        return Html(format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p>{}</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+            e
+        ))
+        .into_response();
+    }
+
+    // Profile-specific required files.
+    if let Some((_kind, required_path)) = required_service_file_and_kind(&profile) {
+        let ok = files
+            .iter()
+            .any(|f| f.path == required_path && f.file_type == FileType::Text);
+        if !ok {
+            return Html(format!(
+                r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p><strong>Missing required file for {}</strong>: <code>{}</code> (must be a text file)</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+                profile, required_path
+            ))
+            .into_response();
+        }
+    }
+
+    let rp_in = form.resource_profile.clone().unwrap_or_default();
+    let rp = rp_in.trim();
+    let resource_profile = match profile {
+        DeploymentProfile::Systemd | DeploymentProfile::ProcessMaster => {
+            if rp.is_empty() {
+                return Html(format!(
+                    r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p><strong>Resource profile is required</strong> for <code>{}</code> manifests.</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+                    profile
+                ))
+                .into_response();
+            }
+            if !resource_profile_exists(&config, rp) {
+                return Html(format!(
+                    r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p><strong>Unknown resource profile:</strong> <code>{}</code></p>
+            <p>Please create it under <a href="/resource-profiles">Resource Profiles</a> (or select <code>unlimited</code>).</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+                    rp
+                ))
+                .into_response();
+            }
+            rp.to_string()
+        }
+        _ => {
+            // Deploy/Supervisor: optional; default to "unlimited" if not set.
+            if rp.is_empty() {
+                BUILTIN_PROFILE_UNLIMITED.to_string()
+            } else if resource_profile_exists(&config, rp) {
+                rp.to_string()
+            } else {
+                return Html(format!(
+                    r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p><strong>Unknown resource profile:</strong> <code>{}</code></p>
+            <p>Please create it under <a href="/resource-profiles">Resource Profiles</a> (or select <code>unlimited</code>).</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+                    rp
+                ))
+                .into_response();
+            }
+        }
     };
     
     // Parse log collection fields with new defaults
@@ -915,6 +1938,12 @@ async fn add_manifest(
     let manifest = DeploymentManifest {
         files,
         profile,
+        resource_profile,
+        service_owner,
+        service_group,
+        service_folder_mode,
+        service_folder_owner,
+        service_folder_group,
         bucket: form.bucket,
         collect_logs,
         log_files,
@@ -942,12 +1971,14 @@ async fn edit_manifest_page(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     let selected_bucket = manifest.bucket.clone();
+    let resource_profiles = resource_profile_names(&config);
     
     let template = EditManifestTemplate {
         manifest_name: query.name,
         manifest,
         buckets,
         selected_bucket,
+        resource_profiles,
     };
     
     HtmlTemplate(template).into_response()
@@ -970,26 +2001,165 @@ async fn update_manifest(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
+
+    let service_owner = form.service_owner.trim().to_string();
+    let service_group = form.service_group.trim().to_string();
+    if let Err(e) = validate_service_identity(&service_owner, &service_group) {
+        return Html(format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests/edit?name={}">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p>{}</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests/edit?name={}">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+            form.original_name, e, form.original_name
+        ))
+        .into_response();
+    }
+
+    let service_folder_mode = form
+        .service_folder_mode
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("0700")
+        .to_string();
+    if let Err(e) = validate_service_folder_meta(&service_folder_mode) {
+        return Html(format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests/edit?name={}">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p>{}</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests/edit?name={}">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+            form.original_name, e, form.original_name
+        ))
+        .into_response();
+    }
+
+    let service_folder_owner = form
+        .service_folder_owner
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let service_folder_group = form
+        .service_folder_group
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    if service_folder_owner.is_some() ^ service_folder_group.is_some() {
+        return Html(format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests/edit?name={}">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p>Service folder ownership override must include both owner and group (user:group).</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests/edit?name={}">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+            form.original_name, form.original_name
+        ))
+        .into_response();
+    }
+    let (service_folder_owner, service_folder_group) =
+        match (&service_folder_owner, &service_folder_group) {
+            (Some(o), Some(g)) if o == &service_owner && g == &service_group => (None, None),
+            _ => (service_folder_owner, service_folder_group),
+        };
+    if let Err(e) = validate_optional_owner_group("service_folder_owner", &service_folder_owner) {
+        return Html(format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests/edit?name={}">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p>{}</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests/edit?name={}">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+            form.original_name, e, form.original_name
+        ))
+        .into_response();
+    }
+    if let Err(e) = validate_optional_owner_group("service_folder_group", &service_folder_group) {
+        return Html(format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests/edit?name={}">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p>{}</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests/edit?name={}">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+            form.original_name, e, form.original_name
+        ))
+        .into_response();
+    }
     
-    let owners: Vec<String> = form.owners
+    let owners: Vec<Option<String>> = form.owners
         .lines()
         .map(|s| s.trim().to_string())
-        .map(|s| if s.is_empty() { "root".to_string() } else { s })
+        .map(|s| if s.is_empty() { None } else { Some(s) })
         .collect();
     
-    let groups: Vec<String> = form.groups
+    let groups: Vec<Option<String>> = form.groups
         .lines()
         .map(|s| s.trim().to_string())
-        .map(|s| if s.is_empty() { "root".to_string() } else { s })
+        .map(|s| if s.is_empty() { None } else { Some(s) })
         .collect();
     
-    let modes: Vec<String> = form.modes
+    let modes: Vec<Option<String>> = form.modes
         .lines()
         .map(|s| s.trim().to_string())
-        .map(|s| if s.is_empty() { "0600".to_string() } else { s })
+        .map(|s| if s.is_empty() { None } else { Some(s) })
         .collect();
     
-    let mut files: Vec<ManifestFile> = file_paths.iter()
+    let files: Vec<ManifestFile> = file_paths.iter()
         .zip(file_types.iter())
         .enumerate()
         .map(|(i, (path, ftype))| ManifestFile {
@@ -999,18 +2169,11 @@ async fn update_manifest(
                 "folder" => FileType::Folder,
                 _ => FileType::Binary,
             },
-            owner: owners.get(i).cloned().unwrap_or_else(|| "root".to_string()),
-            group: groups.get(i).cloned().unwrap_or_else(|| "root".to_string()),
-            mode: modes.get(i).cloned().unwrap_or_else(|| "0600".to_string()),
+            owner: owners.get(i).cloned().unwrap_or(None),
+            group: groups.get(i).cloned().unwrap_or(None),
+            mode: modes.get(i).cloned().unwrap_or(None),
         })
         .collect();
-    
-    // Auto-set mode to 0700 for shell scripts (.sh, .bash)
-    for file in &mut files {
-        if file.path.ends_with(".sh") || file.path.ends_with(".bash") {
-            file.mode = "0700".to_string();
-        }
-    }
     
     // Validate file paths (applies to all profiles)
     for file in &files {
@@ -1050,8 +2213,166 @@ async fn update_manifest(
     let profile = match form.profile.to_lowercase().as_str() {
         "supervisor" => DeploymentProfile::Supervisor,
         "systemd" => DeploymentProfile::Systemd,
+        "processmaster" => DeploymentProfile::ProcessMaster,
         "deploy" => DeploymentProfile::Deploy,
         _ => DeploymentProfile::Systemd,
+    };
+
+    if let Err(e) = validate_run_sh(&files, &profile) {
+        return Html(format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests/edit?name={}">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p>{}</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests/edit?name={}">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+            form.original_name, e, form.original_name
+        ))
+        .into_response();
+    }
+    if let Err(e) = validate_logs_folder(&files, &profile) {
+        return Html(format!(
+            r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests/edit?name={}">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p>{}</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests/edit?name={}">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+            form.original_name, e, form.original_name
+        ))
+        .into_response();
+    }
+
+    // Profile-specific required files.
+    if let Some((_kind, required_path)) = required_service_file_and_kind(&profile) {
+        let ok = files
+            .iter()
+            .any(|f| f.path == required_path && f.file_type == FileType::Text);
+        if !ok {
+            return Html(format!(
+                r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests/edit?name={}">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p><strong>Missing required file for {}</strong>: <code>{}</code> (must be a text file)</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests/edit?name={}">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+                form.original_name, profile, required_path, form.original_name
+            ))
+            .into_response();
+        }
+    }
+
+    let rp_in = form.resource_profile.clone().unwrap_or_default();
+    let rp = rp_in.trim();
+    let resource_profile = match profile {
+        DeploymentProfile::Systemd | DeploymentProfile::ProcessMaster => {
+            if rp.is_empty() {
+                return Html(format!(
+                    r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests/edit?name={}">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p><strong>Resource profile is required</strong> for <code>{}</code> manifests.</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests/edit?name={}">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+                    form.original_name, profile, form.original_name
+                ))
+                .into_response();
+            }
+            if !resource_profile_exists(&config, rp) {
+                return Html(format!(
+                    r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests/edit?name={}">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p><strong>Unknown resource profile:</strong> <code>{}</code></p>
+            <p>Please create it under <a href="/resource-profiles">Resource Profiles</a> (or select <code>unlimited</code>).</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests/edit?name={}">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+                    form.original_name, rp, form.original_name
+                ))
+                .into_response();
+            }
+            rp.to_string()
+        }
+        _ => {
+            // Deploy/Supervisor: optional; default to "unlimited" if not set.
+            if rp.is_empty() {
+                BUILTIN_PROFILE_UNLIMITED.to_string()
+            } else if resource_profile_exists(&config, rp) {
+                rp.to_string()
+            } else {
+                return Html(format!(
+                    r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests/edit?name={}">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p><strong>Unknown resource profile:</strong> <code>{}</code></p>
+            <p>Please create it under <a href="/resource-profiles">Resource Profiles</a> (or select <code>unlimited</code>).</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests/edit?name={}">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+                    form.original_name, rp, form.original_name
+                ))
+                .into_response();
+            }
+        }
     };
     
     // Parse log collection fields with new defaults
@@ -1077,6 +2398,12 @@ async fn update_manifest(
     let manifest = DeploymentManifest {
         files,
         profile,
+        resource_profile,
+        service_owner,
+        service_group,
+        service_folder_mode,
+        service_folder_owner,
+        service_folder_group,
         bucket: form.bucket,
         collect_logs,
         log_files,
@@ -1120,6 +2447,1033 @@ async fn deployments_page(AxumState(state): AxumState<AppState>) -> impl IntoRes
         existing_deployments,
     };
     HtmlTemplate(template)
+}
+
+async fn scan_orphan_deployments(
+    state: &AppState,
+) -> (Vec<(String, BucketConfig)>, std::collections::HashSet<String>, u32, u64) {
+    let cfg = state.read().unwrap();
+    let buckets = cfg
+        .buckets
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect::<Vec<_>>();
+    let active = cfg.manifests.keys().cloned().collect::<std::collections::HashSet<_>>();
+    (buckets, active, cfg.s3_retry_count, cfg.s3_retry_delay_ms)
+}
+
+async fn deployments_cleanup_preview(AxumState(state): AxumState<AppState>) -> impl IntoResponse {
+    // Snapshot config and then scan all buckets for orphan deployments, but DO NOT delete.
+    let (buckets, active_manifests, retry_count, retry_delay_ms) = scan_orphan_deployments(&state).await;
+
+    let mut rows: Vec<CleanupOrphanVersionRow> = Vec::new();
+    let mut orphan_manifests_set: std::collections::HashSet<(String, String)> = std::collections::HashSet::new(); // (bucket_display, manifest)
+    let mut total_objects: usize = 0;
+
+    for (bucket_display, bucket_cfg) in buckets {
+        let client = create_s3_client(&bucket_cfg).await;
+        let bucket_name = bucket_cfg.bucket_name.clone();
+
+        // List top-level manifest folders under deployments/
+        let base_prefix = "deployments/".to_string();
+        let prefix = bucket_cfg.full_key(&base_prefix);
+        let mut continuation: Option<String> = None;
+        let mut orphan_manifests: Vec<String> = Vec::new();
+
+        loop {
+            let op_name = format!("deployments_cleanup_preview:list_manifests:{}:{}", bucket_name, prefix);
+            let resp = retry_s3_operation(
+                &op_name,
+                retry_count,
+                retry_delay_ms,
+                || {
+                    let client = client.clone();
+                    let bucket = bucket_name.clone();
+                    let prefix = prefix.clone();
+                    let token = continuation.clone();
+                    async move {
+                        let mut req = client
+                            .list_objects_v2()
+                            .bucket(&bucket)
+                            .prefix(&prefix)
+                            .delimiter("/");
+                        if let Some(t) = token {
+                            req = req.continuation_token(t);
+                        }
+                        req.send().await
+                    }
+                },
+            )
+            .await;
+
+            let output = match resp {
+                Ok(o) => o,
+                Err(_) => break,
+            };
+
+            if let Some(common_prefixes) = output.common_prefixes {
+                for p in common_prefixes {
+                    if let Some(full_p) = p.prefix {
+                        let rel = if let Some(stripped) = bucket_cfg.strip_prefix(&full_p) {
+                            stripped.strip_prefix(&base_prefix).unwrap_or(stripped)
+                        } else {
+                            full_p.strip_prefix(&prefix).unwrap_or(&full_p)
+                        };
+                        let manifest_name = rel.trim_end_matches('/').split('/').next().unwrap_or("").to_string();
+                        if manifest_name.is_empty() {
+                            continue;
+                        }
+                        if !active_manifests.contains(&manifest_name) {
+                            orphan_manifests.push(manifest_name);
+                        }
+                    }
+                }
+            }
+
+            if output.is_truncated.unwrap_or(false) {
+                continuation = output.next_continuation_token;
+            } else {
+                break;
+            }
+        }
+
+        orphan_manifests.sort();
+        orphan_manifests.dedup();
+
+        // For each orphan manifest, list versions and count objects per version.
+        for manifest_name in orphan_manifests {
+            let versions_prefix_base = format!("deployments/{}/", manifest_name);
+            let versions_prefix = bucket_cfg.full_key(&versions_prefix_base);
+
+            let op_name = format!("deployments_cleanup_preview:list_versions:{}:{}", bucket_name, versions_prefix);
+            let result = retry_s3_operation(
+                &op_name,
+                retry_count,
+                retry_delay_ms,
+                || {
+                    let client = client.clone();
+                    let bucket = bucket_name.clone();
+                    let prefix = versions_prefix.clone();
+                    async move {
+                        client
+                            .list_objects_v2()
+                            .bucket(&bucket)
+                            .prefix(&prefix)
+                            .delimiter("/")
+                            .send()
+                            .await
+                    }
+                },
+            )
+            .await;
+
+            let output = match result {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+
+            let mut versions: Vec<String> = Vec::new();
+            if let Some(common_prefixes) = output.common_prefixes {
+                for cp in common_prefixes {
+                    if let Some(p) = cp.prefix {
+                        let rel = p.strip_prefix(&versions_prefix).unwrap_or(&p);
+                        let v = rel.trim_end_matches('/').split('/').next().unwrap_or("").to_string();
+                        if !v.is_empty() {
+                            versions.push(v);
+                        }
+                    }
+                }
+            }
+            versions.sort();
+            versions.dedup();
+
+            for version in versions {
+                let delete_prefix_base = format!("deployments/{}/{}/", manifest_name, version);
+                let delete_prefix = bucket_cfg.full_key(&delete_prefix_base);
+
+                let mut token: Option<String> = None;
+                let mut count: usize = 0;
+                loop {
+                    let op_name = format!("deployments_cleanup_preview:count:{}:{}", bucket_name, delete_prefix);
+                    let resp = retry_s3_operation(
+                        &op_name,
+                        retry_count,
+                        retry_delay_ms,
+                        || {
+                            let client = client.clone();
+                            let bucket = bucket_name.clone();
+                            let prefix = delete_prefix.clone();
+                            let token = token.clone();
+                            async move {
+                                let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
+                                if let Some(t) = token {
+                                    req = req.continuation_token(t);
+                                }
+                                req.send().await
+                            }
+                        },
+                    )
+                    .await;
+
+                    let out = match resp {
+                        Ok(o) => o,
+                        Err(_) => break,
+                    };
+
+                    count += out.contents.unwrap_or_default().len();
+                    if out.is_truncated.unwrap_or(false) {
+                        token = out.next_continuation_token;
+                    } else {
+                        break;
+                    }
+                }
+
+                if count > 0 {
+                    orphan_manifests_set.insert((bucket_display.clone(), manifest_name.clone()));
+                    total_objects += count;
+                    rows.push(CleanupOrphanVersionRow {
+                        bucket_display: bucket_display.clone(),
+                        manifest_name: manifest_name.clone(),
+                        version,
+                        object_count: count,
+                    });
+                }
+            }
+        }
+    }
+
+    rows.sort_by(|a, b| {
+        a.bucket_display
+            .cmp(&b.bucket_display)
+            .then_with(|| a.manifest_name.cmp(&b.manifest_name))
+            .then_with(|| a.version.cmp(&b.version))
+    });
+
+    let template = CleanupDeploymentTemplate {
+        orphan_manifests_count: orphan_manifests_set.len(),
+        orphan_versions_count: rows.len(),
+        orphan_objects_total: total_objects,
+        orphan_versions: rows,
+    };
+    HtmlTemplate(template).into_response()
+}
+
+async fn deployments_cleanup_execute(AxumState(state): AxumState<AppState>) -> impl IntoResponse {
+    use aws_sdk_s3::types::{Delete, ObjectIdentifier};
+    fn escape_html(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace('\'', "&#39;")
+    }
+
+    // Snapshot config while holding the lock (then drop before awaiting).
+    let (buckets, active_manifests, retry_count, retry_delay_ms) = scan_orphan_deployments(&state).await;
+
+    // Scan all buckets for deployments/<manifest>/ prefixes, delete ones not in config.manifests.
+    let mut deleted_total: usize = 0;
+    let mut deleted_manifests: Vec<(String, String, usize, bool)> = Vec::new(); // (bucket_display, manifest, objects_deleted, empty_after)
+    let mut issues: Vec<(String, String, String)> = Vec::new(); // (bucket_display, manifest, message)
+
+    for (bucket_display, bucket_cfg) in buckets {
+        let client = create_s3_client(&bucket_cfg).await;
+        let bucket_name = bucket_cfg.bucket_name.clone();
+
+        // List top-level manifest folders under deployments/
+        let base_prefix = "deployments/".to_string();
+        let prefix = bucket_cfg.full_key(&base_prefix);
+
+        let mut continuation: Option<String> = None;
+        let mut orphan_manifests: Vec<String> = Vec::new();
+
+        loop {
+            let op_name = format!("deployments_cleanup:list_manifests:{}:{}", bucket_name, prefix);
+            let resp = retry_s3_operation(
+                &op_name,
+                retry_count,
+                retry_delay_ms,
+                || {
+                    let client = client.clone();
+                    let bucket = bucket_name.clone();
+                    let prefix = prefix.clone();
+                    let token = continuation.clone();
+                    async move {
+                        let mut req = client
+                            .list_objects_v2()
+                            .bucket(&bucket)
+                            .prefix(&prefix)
+                            .delimiter("/");
+                        if let Some(t) = token {
+                            req = req.continuation_token(t);
+                        }
+                        req.send().await
+                    }
+                },
+            )
+            .await;
+
+            let output = match resp {
+                Ok(o) => o,
+                Err(_) => break,
+            };
+
+            if let Some(common_prefixes) = output.common_prefixes {
+                for p in common_prefixes {
+                    if let Some(full_p) = p.prefix {
+                        // Strip bucket prefix and then "deployments/" to get manifest name.
+                        let rel = if let Some(stripped) = bucket_cfg.strip_prefix(&full_p) {
+                            stripped.strip_prefix(&base_prefix).unwrap_or(stripped)
+                        } else {
+                            full_p.strip_prefix(&prefix).unwrap_or(&full_p)
+                        };
+                        let manifest_name = rel.trim_end_matches('/').split('/').next().unwrap_or("").to_string();
+                        if manifest_name.is_empty() {
+                            continue;
+                        }
+                        if !active_manifests.contains(&manifest_name) {
+                            orphan_manifests.push(manifest_name);
+                        }
+                    }
+                }
+            }
+
+            if output.is_truncated.unwrap_or(false) {
+                continuation = output.next_continuation_token;
+            } else {
+                break;
+            }
+        }
+
+        orphan_manifests.sort();
+        orphan_manifests.dedup();
+
+        for manifest_name in orphan_manifests {
+            let delete_prefix_base = format!("deployments/{}/", manifest_name);
+            let delete_prefix = bucket_cfg.full_key(&delete_prefix_base);
+            let mut token: Option<String> = None;
+            let mut objects_deleted: usize = 0;
+            let mut saw_any_delete_error = false;
+
+            loop {
+                let op_name = format!("deployments_cleanup:list_objects:{}:{}", bucket_name, delete_prefix);
+                let resp = retry_s3_operation(
+                    &op_name,
+                    retry_count,
+                    retry_delay_ms,
+                    || {
+                        let client = client.clone();
+                        let bucket = bucket_name.clone();
+                        let prefix = delete_prefix.clone();
+                        let token = token.clone();
+                        async move {
+                            let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
+                            if let Some(t) = token {
+                                req = req.continuation_token(t);
+                            }
+                            req.send().await
+                        }
+                    },
+                )
+                .await;
+
+                let output = match resp {
+                    Ok(o) => o,
+                    Err(_) => break,
+                };
+
+                let keys: Vec<String> = output
+                    .contents
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|obj| obj.key)
+                    .collect();
+
+                if !keys.is_empty() {
+                    // Delete in batches up to 1000.
+                    for chunk in keys.chunks(1000) {
+                        let objs = chunk
+                            .iter()
+                            .map(|k| {
+                                ObjectIdentifier::builder()
+                                    .key(k)
+                                    .build()
+                                    .expect("ObjectIdentifier build")
+                            })
+                            .collect::<Vec<_>>();
+                        let del = Delete::builder()
+                            .set_objects(Some(objs))
+                            // We want a non-empty `deleted()` list for accurate counting.
+                            .quiet(false)
+                            .build()
+                            .expect("Delete build");
+
+                        let op_name = format!("deployments_cleanup:delete_objects:{}:{}", bucket_name, delete_prefix);
+                        let resp = retry_s3_operation(
+                            &op_name,
+                            retry_count,
+                            retry_delay_ms,
+                            || {
+                                let client = client.clone();
+                                let bucket = bucket_name.clone();
+                                let del = del.clone();
+                                async move {
+                                    client
+                                        .delete_objects()
+                                        .bucket(&bucket)
+                                        .delete(del)
+                                        .send()
+                                        .await
+                                }
+                            },
+                        )
+                        .await;
+
+                        match resp {
+                            Ok(out) => {
+                                // Count confirmed deletes; surface per-object failures.
+                                objects_deleted += out.deleted().len();
+                                for err in out.errors() {
+                                    saw_any_delete_error = true;
+                                    let key = err.key().unwrap_or("-");
+                                    let code = err.code().unwrap_or("-");
+                                    let msg = err.message().unwrap_or("-");
+                                    issues.push((
+                                        bucket_display.clone(),
+                                        manifest_name.clone(),
+                                        format!("delete failed: key={} code={} message={}", key, code, msg),
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                let err_dbg = format!("{:?}", e);
+                                // Aliyun OSS (S3-compatible) can require Content-MD5 for multi-delete requests.
+                                // If we hit that, fall back to per-object delete_object calls.
+                                if err_dbg.contains("MissingArgument") && err_dbg.contains("Content-MD5") {
+                                    for k in chunk {
+                                        let op_name = format!("deployments_cleanup:delete_object:{}:{}", bucket_name, k);
+                                        let one = retry_s3_operation(
+                                            &op_name,
+                                            retry_count,
+                                            retry_delay_ms,
+                                            || {
+                                                let client = client.clone();
+                                                let bucket = bucket_name.clone();
+                                                let key = k.clone();
+                                                async move {
+                                                    client
+                                                        .delete_object()
+                                                        .bucket(&bucket)
+                                                        .key(&key)
+                                                        .send()
+                                                        .await
+                                                }
+                                            },
+                                        )
+                                        .await;
+                                        match one {
+                                            Ok(_) => objects_deleted += 1,
+                                            Err(e) => {
+                                                saw_any_delete_error = true;
+                                                issues.push((
+                                                    bucket_display.clone(),
+                                                    manifest_name.clone(),
+                                                    format!("delete failed: key={} err={:?}", k, e),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    saw_any_delete_error = true;
+                                    issues.push((
+                                        bucket_display.clone(),
+                                        manifest_name.clone(),
+                                        format!("delete request failed: {:?}", e),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if output.is_truncated.unwrap_or(false) {
+                    token = output.next_continuation_token;
+                } else {
+                    break;
+                }
+            }
+
+            // Verify prefix is empty after delete (best-effort).
+            let empty_after = if saw_any_delete_error {
+                false
+            } else {
+                let op_name = format!("deployments_cleanup:verify_empty:{}:{}", bucket_name, delete_prefix);
+                match retry_s3_operation(
+                    &op_name,
+                    retry_count,
+                    retry_delay_ms,
+                    || {
+                        let client = client.clone();
+                        let bucket = bucket_name.clone();
+                        let prefix = delete_prefix.clone();
+                        async move {
+                            client
+                                .list_objects_v2()
+                                .bucket(&bucket)
+                                .prefix(&prefix)
+                                .max_keys(1)
+                                .send()
+                                .await
+                        }
+                    },
+                )
+                .await
+                {
+                    Ok(o) => {
+                        let first_key = o
+                            .contents
+                            .as_ref()
+                            .and_then(|v| v.first())
+                            .and_then(|x| x.key.as_deref());
+                        if let Some(k) = first_key {
+                            issues.push((
+                                bucket_display.clone(),
+                                manifest_name.clone(),
+                                format!("prefix still has objects after delete (example key: {})", k),
+                            ));
+                            false
+                        } else {
+                            true
+                        }
+                    }
+                    Err(e) => {
+                        issues.push((
+                            bucket_display.clone(),
+                            manifest_name.clone(),
+                            format!("failed to verify prefix empty: {:?}", e),
+                        ));
+                        false
+                    }
+                }
+            };
+
+            deleted_total += objects_deleted;
+            deleted_manifests.push((bucket_display.clone(), manifest_name, objects_deleted, empty_after));
+        }
+    }
+
+    deleted_manifests.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    issues.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let mut rows = String::new();
+    for (bucket_display, manifest, count, empty_after) in &deleted_manifests {
+        rows.push_str(&format!(
+            "<tr><td><code>{}</code></td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td></tr>",
+            escape_html(bucket_display),
+            escape_html(manifest),
+            count,
+            if *empty_after { "<span class=\"badge bg-success\">Empty</span>" } else { "<span class=\"badge bg-warning text-dark\">Not empty</span>" }
+        ));
+    }
+
+    let mut issue_rows = String::new();
+    for (bucket_display, manifest, msg) in &issues {
+        issue_rows.push_str(&format!(
+            "<tr><td><code>{}</code></td><td><code>{}</code></td><td><code style=\"white-space: pre-wrap;\">{}</code></td></tr>",
+            escape_html(bucket_display),
+            escape_html(manifest),
+            escape_html(msg),
+        ));
+    }
+
+    let body = format!(
+        r#"<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
+  <title>Cleanup Deployment - Fleetman</title>
+</head>
+<body>
+  <div class="container mt-4">
+    <div class="d-flex justify-content-between align-items-center mb-3">
+      <h2 class="mb-0">Cleanup Deployment</h2>
+      <a class="btn btn-outline-secondary" href="/deployments"><i class="bi bi-arrow-left"></i> Back</a>
+    </div>
+    <div class="alert alert-info">
+      Deleted <strong>{}</strong> object(s) across <strong>{}</strong> orphan manifest(s).
+    </div>
+    {}
+    {}
+  </div>
+</body>
+</html>"#,
+        deleted_total,
+        deleted_manifests.len(),
+        if issues.is_empty() {
+            "".to_string()
+        } else {
+            format!(
+                "<div class=\"alert alert-warning\"><strong>Some objects were not deleted.</strong> See details below.</div>\
+                 <div class=\"table-responsive mb-4\"><table class=\"table table-sm table-striped\"><thead><tr><th>Bucket</th><th>Manifest</th><th>Issue</th></tr></thead><tbody>{}</tbody></table></div>",
+                issue_rows
+            )
+        },
+        if deleted_manifests.is_empty() {
+            "<p class=\"text-muted\">No orphan deployments found.</p>".to_string()
+        } else {
+            format!(
+                "<div class=\"table-responsive\"><table class=\"table table-sm table-striped\"><thead><tr><th>Bucket</th><th>Manifest</th><th>Objects deleted</th><th>Post-check</th></tr></thead><tbody>{}</tbody></table></div>",
+                rows
+            )
+        }
+    );
+
+    Html(body).into_response()
+}
+
+#[derive(Deserialize)]
+struct RecycleActionForm {
+    bucket: String,          // bucket display name (key in config.buckets)
+    recycle_prefix: String,  // base prefix like "recycle/<...>/" (without bucket prefix)
+}
+
+fn parse_recycle_prefix(recycle_prefix_base: &str) -> (String, String, String) {
+    // Expected: recycle/<manifest>-<version>-<timestamp>/
+    // manifest may contain '-' so use regex that finds a version token.
+    // Timestamp must be exactly: yyyyMMdd-HHmmss-SSS (time of deletion)
+    let re = Regex::new(r"^recycle/(.+?)-(v[0-9]+\.[0-9]+\.[0-9]+)-([0-9]{8}-[0-9]{6}-[0-9]{3})/$").unwrap();
+    if let Some(c) = re.captures(recycle_prefix_base) {
+        let manifest = c.get(1).map(|m| m.as_str()).unwrap_or("unknown").to_string();
+        let version = c.get(2).map(|m| m.as_str()).unwrap_or("-").to_string();
+        let deleted_at = c
+            .get(3)
+            .map(|m| m.as_str())
+            .unwrap_or("-")
+            .to_string();
+        (manifest, version, deleted_at)
+    } else {
+        ("unknown".to_string(), "-".to_string(), "-".to_string())
+    }
+}
+
+fn format_recycle_deleted_at_human(raw: &str) -> String {
+    // raw: yyyyMMdd-HHmmss-SSS
+    let Ok(dt) = chrono::NaiveDateTime::parse_from_str(raw, "%Y%m%d-%H%M%S-%3f") else {
+        return raw.to_string();
+    };
+    dt.format("%d %b %Y %H:%M:%S").to_string()
+}
+
+async fn list_recycle_entries(
+    state: &AppState,
+) -> Vec<RecycleEntryDisplay> {
+    let (buckets, retry_count, retry_delay_ms) = {
+        let cfg = state.read().unwrap();
+        let buckets = cfg
+            .buckets
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect::<Vec<_>>();
+        (buckets, cfg.s3_retry_count, cfg.s3_retry_delay_ms)
+    };
+
+    let mut entries: Vec<RecycleEntryDisplay> = Vec::new();
+
+    for (bucket_display, bucket_cfg) in buckets {
+        let client = create_s3_client(&bucket_cfg).await;
+        let bucket_name = bucket_cfg.bucket_name.clone();
+
+        let base_prefix = "recycle/".to_string();
+        let prefix = bucket_cfg.full_key(&base_prefix);
+
+        let mut continuation: Option<String> = None;
+        loop {
+            let op_name = format!("recycle:list:{}:{}", bucket_name, prefix);
+            let resp = retry_s3_operation(
+                &op_name,
+                retry_count,
+                retry_delay_ms,
+                || {
+                    let client = client.clone();
+                    let bucket = bucket_name.clone();
+                    let prefix = prefix.clone();
+                    let token = continuation.clone();
+                    async move {
+                        let mut req = client
+                            .list_objects_v2()
+                            .bucket(&bucket)
+                            .prefix(&prefix)
+                            .delimiter("/");
+                        if let Some(t) = token {
+                            req = req.continuation_token(t);
+                        }
+                        req.send().await
+                    }
+                },
+            )
+            .await;
+
+            let output = match resp {
+                Ok(o) => o,
+                Err(_) => break,
+            };
+
+            if let Some(common_prefixes) = output.common_prefixes {
+                for cp in common_prefixes {
+                    let Some(full_p) = cp.prefix else { continue };
+                    // Convert to base prefix without bucket prefix.
+                    let rel = if let Some(stripped) = bucket_cfg.strip_prefix(&full_p) {
+                        stripped.to_string()
+                    } else {
+                        full_p.strip_prefix(&prefix).unwrap_or(&full_p).to_string()
+                    };
+                    if !rel.starts_with("recycle/") {
+                        continue;
+                    }
+                    let recycle_prefix_base = rel;
+
+                    // Count objects under this recycle prefix.
+                    let full_recycle_prefix = bucket_cfg.full_key(&recycle_prefix_base);
+                    let mut token2: Option<String> = None;
+                    let mut count: usize = 0;
+                    loop {
+                        let op_name = format!("recycle:count:{}:{}", bucket_name, full_recycle_prefix);
+                        let resp = retry_s3_operation(
+                            &op_name,
+                            retry_count,
+                            retry_delay_ms,
+                            || {
+                                let client = client.clone();
+                                let bucket = bucket_name.clone();
+                                let prefix = full_recycle_prefix.clone();
+                                let token = token2.clone();
+                                async move {
+                                    let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
+                                    if let Some(t) = token {
+                                        req = req.continuation_token(t);
+                                    }
+                                    req.send().await
+                                }
+                            },
+                        )
+                        .await;
+                        let out = match resp {
+                            Ok(o) => o,
+                            Err(_) => break,
+                        };
+                        count += out.contents.unwrap_or_default().len();
+                        if out.is_truncated.unwrap_or(false) {
+                            token2 = out.next_continuation_token;
+                        } else {
+                            break;
+                        }
+                    }
+
+                    let (manifest_name, version, deleted_at_raw) = parse_recycle_prefix(&recycle_prefix_base);
+                    let deleted_at_display = if deleted_at_raw == "-" {
+                        "-".to_string()
+                    } else {
+                        format_recycle_deleted_at_human(&deleted_at_raw)
+                    };
+                    entries.push(RecycleEntryDisplay {
+                        bucket_display: bucket_display.clone(),
+                        recycle_prefix_base,
+                        manifest_name,
+                        version,
+                        deleted_at_raw,
+                        deleted_at_display,
+                        object_count: count,
+                    });
+                }
+            }
+
+            if output.is_truncated.unwrap_or(false) {
+                continuation = output.next_continuation_token;
+            } else {
+                break;
+            }
+        }
+    }
+
+    entries.sort_by(|a, b| {
+        a.bucket_display
+            .cmp(&b.bucket_display)
+            .then_with(|| a.manifest_name.cmp(&b.manifest_name))
+            .then_with(|| a.version.cmp(&b.version))
+            .then_with(|| b.deleted_at_raw.cmp(&a.deleted_at_raw))
+    });
+    entries
+}
+
+async fn recycle_bin_page(AxumState(state): AxumState<AppState>) -> impl IntoResponse {
+    let entries = list_recycle_entries(&state).await;
+    let total_objects = entries.iter().map(|e| e.object_count).sum();
+    HtmlTemplate(RecycleBinTemplate { entries, total_objects }).into_response()
+}
+
+async fn recycle_clear_preview(AxumState(state): AxumState<AppState>) -> impl IntoResponse {
+    let entries = list_recycle_entries(&state).await;
+    let total_objects = entries.iter().map(|e| e.object_count).sum();
+    HtmlTemplate(RecycleClearTemplate { entries, total_objects }).into_response()
+}
+
+async fn recycle_restore(
+    AxumState(state): AxumState<AppState>,
+    Form(form): Form<RecycleActionForm>,
+) -> impl IntoResponse {
+    let (bucket_cfg, retry_count, retry_delay_ms) = {
+        let cfg = state.read().unwrap();
+        let bc = match cfg.buckets.get(&form.bucket) {
+            Some(bc) => bc.clone(),
+            None => return Redirect::to("/deployments/recycle").into_response(),
+        };
+        (bc, cfg.s3_retry_count, cfg.s3_retry_delay_ms)
+    };
+
+    let client = create_s3_client(&bucket_cfg).await;
+    let bucket_name = bucket_cfg.bucket_name.clone();
+
+    let recycle_prefix_base = form.recycle_prefix;
+    let (manifest_name, version, _deleted_at) = parse_recycle_prefix(&recycle_prefix_base);
+    if manifest_name == "unknown" || version == "-" {
+        return Html("<div class=\"container mt-4\"><div class=\"alert alert-danger\">Cannot restore: unrecognized recycle folder format.</div><a href=\"/deployments/recycle\">Back</a></div>".to_string()).into_response();
+    }
+
+    let dest_prefix_base = format!("deployments/{}/{}/", manifest_name, version);
+    let dest_prefix = bucket_cfg.full_key(&dest_prefix_base);
+    // Safety: refuse to restore if destination already has any objects.
+    let op_name = format!("recycle_restore:dest_exists:{}:{}", bucket_name, dest_prefix);
+    let exists = retry_s3_operation(
+        &op_name,
+        retry_count,
+        retry_delay_ms,
+        || {
+            let client = client.clone();
+            let bucket = bucket_name.clone();
+            let prefix = dest_prefix.clone();
+            async move { client.list_objects_v2().bucket(&bucket).prefix(&prefix).max_keys(1).send().await }
+        },
+    )
+    .await
+    .ok()
+    .and_then(|o| o.contents)
+    .and_then(|v| v.first().and_then(|x| x.key.clone()))
+    .is_some();
+
+    if exists {
+        return Html(format!(
+            r#"<div class="container mt-4"><div class="alert alert-danger">Cannot restore: deployment <code>{}-{}<\/code> already exists.</div><a href="/deployments/recycle">Back</a></div>"#,
+            manifest_name, version
+        ))
+        .into_response();
+    }
+
+    let recycle_prefix = bucket_cfg.full_key(&recycle_prefix_base);
+    // List keys under recycle prefix and copy back, then delete originals.
+    let mut token: Option<String> = None;
+    loop {
+        let op_name = format!("recycle_restore:list:{}:{}", bucket_name, recycle_prefix);
+        let resp = retry_s3_operation(
+            &op_name,
+            retry_count,
+            retry_delay_ms,
+            || {
+                let client = client.clone();
+                let bucket = bucket_name.clone();
+                let prefix = recycle_prefix.clone();
+                let token = token.clone();
+                async move {
+                    let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
+                    if let Some(t) = token {
+                        req = req.continuation_token(t);
+                    }
+                    req.send().await
+                }
+            },
+        )
+        .await;
+
+        let out = match resp {
+            Ok(o) => o,
+            Err(_) => break,
+        };
+        let keys: Vec<String> = out
+            .contents
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|o| o.key)
+            .collect();
+
+        for key in keys {
+            let rel = key.strip_prefix(&recycle_prefix).unwrap_or(&key);
+            let new_key = format!("{}{}", dest_prefix, rel);
+            let copy_source = format!("{}/{}", bucket_name, key);
+
+            let op = format!("recycle_restore:copy:{}->{}", key, new_key);
+            let _ = retry_s3_operation(
+                &op,
+                retry_count,
+                retry_delay_ms,
+                || {
+                    let client = client.clone();
+                    let bucket = bucket_name.clone();
+                    let copy_source = copy_source.clone();
+                    let new_key = new_key.clone();
+                    async move {
+                        client.copy_object().bucket(&bucket).copy_source(copy_source).key(new_key).send().await
+                    }
+                },
+            )
+            .await;
+
+            let op = format!("recycle_restore:delete:{}", key);
+            let _ = retry_s3_operation(
+                &op,
+                retry_count,
+                retry_delay_ms,
+                || {
+                    let client = client.clone();
+                    let bucket = bucket_name.clone();
+                    let key = key.clone();
+                    async move { client.delete_object().bucket(&bucket).key(key).send().await }
+                },
+            )
+            .await;
+        }
+
+        if out.is_truncated.unwrap_or(false) {
+            token = out.next_continuation_token;
+        } else {
+            break;
+        }
+    }
+
+    Redirect::to("/deployments/recycle").into_response()
+}
+
+async fn recycle_delete_permanently(
+    AxumState(state): AxumState<AppState>,
+    Form(form): Form<RecycleActionForm>,
+) -> impl IntoResponse {
+    let (bucket_cfg, retry_count, retry_delay_ms) = {
+        let cfg = state.read().unwrap();
+        let bc = match cfg.buckets.get(&form.bucket) {
+            Some(bc) => bc.clone(),
+            None => return Redirect::to("/deployments/recycle").into_response(),
+        };
+        (bc, cfg.s3_retry_count, cfg.s3_retry_delay_ms)
+    };
+    let client = create_s3_client(&bucket_cfg).await;
+    let bucket_name = bucket_cfg.bucket_name.clone();
+    let recycle_prefix = bucket_cfg.full_key(&form.recycle_prefix);
+
+    // List keys and delete (Aliyun-safe: fall back to per-object delete if multi-delete requires Content-MD5).
+    let mut token: Option<String> = None;
+    loop {
+        let op_name = format!("recycle_delete:list:{}:{}", bucket_name, recycle_prefix);
+        let resp = retry_s3_operation(
+            &op_name,
+            retry_count,
+            retry_delay_ms,
+            || {
+                let client = client.clone();
+                let bucket = bucket_name.clone();
+                let prefix = recycle_prefix.clone();
+                let token = token.clone();
+                async move {
+                    let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
+                    if let Some(t) = token {
+                        req = req.continuation_token(t);
+                    }
+                    req.send().await
+                }
+            },
+        )
+        .await;
+        let out = match resp {
+            Ok(o) => o,
+            Err(_) => break,
+        };
+        let keys: Vec<String> = out
+            .contents
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|o| o.key)
+            .collect();
+
+        if !keys.is_empty() {
+            // Try delete_objects, fallback to delete_object if OSS requires Content-MD5.
+            let objs = keys
+                .iter()
+                .map(|k| aws_sdk_s3::types::ObjectIdentifier::builder().key(k).build().expect("objid"))
+                .collect::<Vec<_>>();
+            let del = aws_sdk_s3::types::Delete::builder()
+                .set_objects(Some(objs))
+                .quiet(false)
+                .build()
+                .expect("delete");
+            let op = format!("recycle_delete:delete_objects:{}:{}", bucket_name, recycle_prefix);
+            let resp = retry_s3_operation(
+                &op,
+                retry_count,
+                retry_delay_ms,
+                || {
+                    let client = client.clone();
+                    let bucket = bucket_name.clone();
+                    let del = del.clone();
+                    async move { client.delete_objects().bucket(&bucket).delete(del).send().await }
+                },
+            )
+            .await;
+            if let Err(e) = resp {
+                let s = format!("{:?}", e);
+                if s.contains("MissingArgument") && s.contains("Content-MD5") {
+                    for k in keys {
+                        let op = format!("recycle_delete:delete_object:{}:{}", bucket_name, k);
+                        let _ = retry_s3_operation(
+                            &op,
+                            retry_count,
+                            retry_delay_ms,
+                            || {
+                                let client = client.clone();
+                                let bucket = bucket_name.clone();
+                                let key = k.clone();
+                                async move { client.delete_object().bucket(&bucket).key(key).send().await }
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+
+        if out.is_truncated.unwrap_or(false) {
+            token = out.next_continuation_token;
+        } else {
+            break;
+        }
+    }
+
+    Redirect::to("/deployments/recycle").into_response()
+}
+
+async fn recycle_clear_execute(AxumState(state): AxumState<AppState>) -> impl IntoResponse {
+    // Execute by reusing list + per-entry delete.
+    let entries = list_recycle_entries(&state).await;
+    for e in entries {
+        let _ = recycle_delete_permanently(
+            AxumState(state.clone()),
+            Form(RecycleActionForm {
+                bucket: e.bucket_display,
+                recycle_prefix: e.recycle_prefix_base,
+            }),
+        )
+        .await;
+    }
+    Redirect::to("/deployments/recycle").into_response()
 }
 
 async fn deployments_create(
@@ -1419,6 +3773,354 @@ struct StagingItem {
     is_folder: bool,
     size: Option<i64>,
     last_modified: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct ServiceTemplateQuery {
+    manifest: String,
+}
+
+async fn api_service_template(
+    AxumState(state): AxumState<AppState>,
+    Query(q): Query<ServiceTemplateQuery>,
+) -> impl IntoResponse {
+    let config = state.read().unwrap();
+    let Some(manifest) = config.manifests.get(&q.manifest) else {
+        return Json(serde_json::json!({ "ok": false, "error": "manifest not found" })).into_response();
+    };
+    let Some((kind, target_path)) = required_service_file_and_kind(&manifest.profile) else {
+        return Json(serde_json::json!({ "ok": false, "error": "manifest profile has no service template" }))
+            .into_response();
+    };
+
+    // Fixed var list (non-resource) for the popup form.
+    // We no longer prompt for vars; generation emits placeholders and sealing blocks unresolved
+    // placeholders (except fleetagent_*).
+    let vars: Vec<&str> = match manifest.profile {
+        DeploymentProfile::Systemd => vec![],
+        DeploymentProfile::ProcessMaster => vec![],
+        _ => vec![],
+    };
+
+    // Provide resource info + systemd translation preview.
+    // For processmaster: no translation needed, keep raw cpu/memory/memory_swap strings.
+    let (cpu_quota, memory_max, memory_swap_max, io_weight, cpu_millis, ram_bytes, swap_bytes, raw_cpu, raw_mem, raw_swap) = {
+        // Built-in unlimited: cpu/ram/swap unlimited, io_weight=100.
+        if manifest.resource_profile == BUILTIN_PROFILE_UNLIMITED {
+            (
+                None,
+                None,
+                None,
+                Some(100u32),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        } else if let Some(rp) = config.resource_profiles.get(&manifest.resource_profile) {
+            let (_, _, _, io_w, cpu_m, ram_b, swap_b) =
+                validate_and_normalize_resource_profile(
+                    rp.cpu.as_deref().unwrap_or(""),
+                    rp.memory.as_deref().unwrap_or(""),
+                    rp.memory_swap.as_deref().unwrap_or(""),
+                    &rp.io_weight.map(|x| x.to_string()).unwrap_or_default(),
+                )
+                .unwrap_or((None, None, None, Some(100), None, None, Some(0)));
+            let cpu_q = cpu_m.map(format_cpu_quota_percent);
+            let mem_max = ram_b.map(format_systemd_bytes);
+            let mem_swap = swap_b.map(format_systemd_bytes);
+            (
+                cpu_q,
+                mem_max,
+                mem_swap,
+                io_w.or(Some(100)),
+                cpu_m,
+                ram_b,
+                swap_b,
+                rp.cpu.clone(),
+                rp.memory.clone(),
+                rp.memory_swap.clone(),
+            )
+        } else {
+            (None, None, None, Some(100), None, None, Some(0), None, None, None)
+        }
+    };
+
+    Json(serde_json::json!({
+        "ok": true,
+        "kind": kind,
+        "target_path": target_path,
+        "resource_profile": manifest.resource_profile,
+        "resource_preview": {
+            "cpu_millis": cpu_millis,
+            "cpu_quota": cpu_quota,
+            "ram_bytes": ram_bytes,
+            "memory_max": memory_max,
+            "swap_bytes": swap_bytes,
+            "memory_swap_max": memory_swap_max,
+            "io_weight": io_weight,
+            "cpu": raw_cpu,
+            "memory": raw_mem,
+            "memory_swap": raw_swap,
+        },
+        "vars": vars,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct GenerateServiceFileReq {
+    manifest: String,
+    version: String,
+    #[serde(default)]
+    file_path: Option<String>,
+    #[serde(default)]
+    values: HashMap<String, String>,
+}
+
+fn generation_targets(profile: &DeploymentProfile) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    if matches!(
+        profile,
+        DeploymentProfile::Systemd | DeploymentProfile::ProcessMaster | DeploymentProfile::Supervisor
+    ) {
+        out.push("run.sh");
+    }
+    if let Some((_kind, svc)) = required_service_file_and_kind(profile) {
+        out.push(svc);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn scan_unresolved_tokens(content: &str) -> (Vec<String>, Vec<String>) {
+    // Returns (blocking_tokens, allowed_tokens) where allowed are fleetagent_*.
+    //
+    // IMPORTANT: users are allowed to put comments in their service files. We therefore ignore
+    // unresolved {{ token }} occurrences on comment-only lines:
+    // - YAML:   "# ..."
+    // - systemd: "# ..." or "; ..."
+    // - shell:  "# ..." (including "#!/bin/sh")
+    let re = Regex::new(r"\{\{\s*([A-Za-z0-9_]+)\s*\}\}").expect("token regex");
+    let mut blocking: Vec<String> = Vec::new();
+    let mut allowed: Vec<String> = Vec::new();
+
+    for line in content.lines() {
+        let t = line.trim_start();
+        let is_comment_line = t.starts_with('#') || t.starts_with(';');
+        if is_comment_line {
+            continue;
+        }
+        for cap in re.captures_iter(line) {
+            let tok = cap.get(1).unwrap().as_str().to_string();
+            if tok.starts_with("fleetagent_") {
+                if !allowed.contains(&tok) {
+                    allowed.push(tok);
+                }
+            } else if !blocking.contains(&tok) {
+                blocking.push(tok);
+            }
+        }
+    }
+
+    blocking.sort();
+    allowed.sort();
+    (blocking, allowed)
+}
+
+async fn generate_service_file(
+    AxumState(state): AxumState<AppState>,
+    Json(req): Json<GenerateServiceFileReq>,
+) -> impl IntoResponse {
+    // Validate version.
+    if let Err(e) = validate_version(&req.version) {
+        return Json(serde_json::json!({ "ok": false, "error": e })).into_response();
+    }
+
+    let (manifest, bucket_config, retry_count, retry_delay_ms) = {
+        let config = state.read().unwrap();
+        let Some(m) = config.manifests.get(&req.manifest) else {
+            return Json(serde_json::json!({ "ok": false, "error": "manifest not found" })).into_response();
+        };
+        let Some(b) = config.buckets.get(&m.bucket) else {
+            return Json(serde_json::json!({ "ok": false, "error": "bucket not found" })).into_response();
+        };
+        (m.clone(), b.clone(), config.s3_retry_count, config.s3_retry_delay_ms)
+    };
+
+    let targets = generation_targets(&manifest.profile);
+    if targets.is_empty() {
+        return Json(serde_json::json!({ "ok": false, "error": "manifest profile has no generated templates" }))
+            .into_response();
+    }
+    let requested = req
+        .file_path
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty());
+    let target_path: &str = match requested {
+        Some(p) => p,
+        None => {
+            // Default to the profile's main service file if present, else run.sh.
+            targets
+                .iter()
+                .find(|p| **p != "run.sh")
+                .copied()
+                .unwrap_or("run.sh")
+        }
+    };
+    if !targets.iter().any(|p| *p == target_path) {
+        return Json(serde_json::json!({ "ok": false, "error": format!("cannot generate file: {}", target_path) }))
+            .into_response();
+    }
+
+    // Ensure the manifest declares the target file (text).
+    let declared = manifest
+        .files
+        .iter()
+        .any(|f| f.path == target_path && f.file_type == FileType::Text);
+    if !declared {
+        return Json(serde_json::json!({
+            "ok": false,
+            "error": format!("manifest does not declare {} as a text file", target_path)
+        }))
+        .into_response();
+    }
+
+    let client = create_s3_client(&bucket_config).await;
+    let is_finalized = is_deployment_finalized(
+        &client,
+        &bucket_config.bucket_name,
+        &req.manifest,
+        &req.version,
+        &bucket_config,
+        retry_count,
+        retry_delay_ms,
+    )
+    .await;
+    if is_finalized {
+        return Json(serde_json::json!({ "ok": false, "error": "deployment is sealed" })).into_response();
+    }
+
+    // Do not prompt for variables anymore.
+    // If user didn't provide a value, render a placeholder like "{{ token }}".
+    let placeholder = |k: &str| format!("{{{{ {} }}}}", k);
+    let get_or_placeholder = |k: &str| req.values.get(k).cloned().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| placeholder(k));
+
+    // Resolve resource profile.
+    // - Processmaster: no translation (keep raw cpu/memory/memory_swap strings)
+    // - Systemd: translate to CPUQuota/MemoryMax/MemorySwapMax
+    let (cpu_quota, memory_max, memory_swap_max, io_weight, _cpu_millis, _ram_bytes, _swap_bytes, raw_cpu, raw_mem, raw_swap) = {
+        let config = state.read().unwrap();
+        if manifest.resource_profile == BUILTIN_PROFILE_UNLIMITED {
+            (None, None, None, Some(100u32), None, None, None, None, None, None)
+        } else if let Some(rp) = config.resource_profiles.get(&manifest.resource_profile) {
+            let (_cpu_s, _ram_s, _swap_s, io_w, cpu_m, ram_b, swap_b) =
+                validate_and_normalize_resource_profile(
+                    rp.cpu.as_deref().unwrap_or(""),
+                    rp.memory.as_deref().unwrap_or(""),
+                    rp.memory_swap.as_deref().unwrap_or(""),
+                    &rp.io_weight.map(|x| x.to_string()).unwrap_or_default(),
+                )
+                .unwrap_or((None, None, Some("0b".to_string()), Some(100), None, None, Some(0)));
+            (
+                cpu_m.map(format_cpu_quota_percent),
+                ram_b.map(format_systemd_bytes),
+                swap_b.map(format_systemd_bytes),
+                io_w.or(Some(100)),
+                cpu_m,
+                ram_b,
+                swap_b,
+                rp.cpu.clone(),
+                rp.memory.clone(),
+                rp.memory_swap.clone(),
+            )
+        } else {
+            (None, None, None, Some(100), None, None, Some(0), None, None, None)
+        }
+    };
+
+    let service_user = manifest.service_owner.clone();
+    let service_group = manifest.service_group.clone();
+
+    let content: String = match (manifest.profile.clone(), target_path) {
+        (_, "run.sh") => {
+            let tpl = RunShTemplate {
+                my_program: get_or_placeholder("my_program"),
+            };
+            match tpl.render() {
+                Ok(s) => s,
+                Err(e) => {
+                    return Json(serde_json::json!({ "ok": false, "error": e.to_string() })).into_response()
+                }
+            }
+        }
+        (DeploymentProfile::Systemd, _) => {
+            let tpl = SystemdServiceUnitTemplate {
+                fleetagent_cell_id: "{{ fleetagent_cell_id }}".to_string(),
+                fleetagent_service_working_dir: "{{ fleetagent_service_working_dir }}".to_string(),
+                service_user: service_user.clone(),
+                service_group: service_group.clone(),
+                cpu_quota,
+                memory_max,
+                memory_swap_max,
+                io_weight,
+            };
+            match tpl.render() {
+                Ok(s) => s,
+                Err(e) => return Json(serde_json::json!({ "ok": false, "error": e.to_string() })).into_response(),
+            }
+        }
+        (DeploymentProfile::ProcessMaster, _) => {
+            let tpl = ProcessMasterServiceTemplate {
+                fleetagent_cell_id: "{{ fleetagent_cell_id }}".to_string(),
+                fleetagent_service_working_dir: "{{ fleetagent_service_working_dir }}".to_string(),
+                service_user: service_user.clone(),
+                service_group: service_group.clone(),
+                cpu: raw_cpu,
+                memory: raw_mem,
+                memory_swap: raw_swap,
+                io_weight: io_weight.or(Some(100)),
+            };
+            match tpl.render() {
+                Ok(s) => s,
+                Err(e) => return Json(serde_json::json!({ "ok": false, "error": e.to_string() })).into_response(),
+            }
+        }
+        _ => {
+            return Json(serde_json::json!({ "ok": false, "error": "manifest profile has no template for this file" }))
+                .into_response()
+        }
+    };
+
+    let base_key = format!("deployments/{}/{}/{}", req.manifest, req.version, target_path);
+    let key = bucket_config.full_key(&base_key);
+    let operation_name = format!("generate_service_file: {}", key);
+
+    let put_res = retry_s3_operation(&operation_name, retry_count, retry_delay_ms, || {
+        let client = client.clone();
+        let bucket = bucket_config.bucket_name.clone();
+        let key = key.clone();
+        let body = content.clone();
+        async move {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from(body.into_bytes()))
+                .send()
+                .await
+        }
+    })
+    .await;
+
+    match put_res {
+        Ok(_) => Json(serde_json::json!({ "ok": true, "path": target_path })).into_response(),
+        Err(e) => Json(serde_json::json!({ "ok": false, "error": format!("{}", e) })).into_response(),
+    }
 }
 
 async fn browse_staging(
@@ -2139,6 +4841,125 @@ async fn finish_deployment(
     if is_deployment_finalized(&client, &bucket_name, &form.manifest, &form.version, &bucket_config, retry_count, retry_delay_ms).await {
         return Redirect::to(&format!("/deployments/start?manifest={}&version={}&edit=true", form.manifest, form.version)).into_response();
     }
+
+    // Block sealing if required files contain unresolved tokens (except fleetagent_*).
+    // This includes run.sh (for systemd/processmaster) and the main service file.
+    for target_path in generation_targets(&manifest.profile) {
+        let key = bucket_config.full_key(&format!(
+            "deployments/{}/{}/{}",
+            form.manifest, form.version, target_path
+        ));
+        let op = format!("finish_deployment_check_tokens: {}", key);
+        let res = retry_s3_operation(&op, retry_count, retry_delay_ms, || {
+            let client = client.clone();
+            let bucket = bucket_name.clone();
+            let key = key.clone();
+            async move { client.get_object().bucket(bucket).key(key).send().await }
+        })
+        .await;
+
+        let output = match res {
+            Ok(o) => o,
+            Err(e) => {
+                return Html(format!(
+                    r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="8;url=/deployments/view?manifest={}&version={}">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Cannot Seal Deployment</h4>
+            <p>Failed to read required file <code>{}</code>: {}</p>
+            <p class="mb-0">Redirecting back in 8 seconds... <a href="/deployments/view?manifest={}&version={}">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+                    form.manifest, form.version, target_path, e, form.manifest, form.version
+                ))
+                .into_response();
+            }
+        };
+
+        let bytes = match output.body.collect().await {
+            Ok(b) => b.into_bytes(),
+            Err(e) => {
+                return Html(format!(
+                    r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="8;url=/deployments/view?manifest={}&version={}">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Cannot Seal Deployment</h4>
+            <p>Failed to read required file <code>{}</code>: {}</p>
+            <p class="mb-0">Redirecting back in 8 seconds... <a href="/deployments/view?manifest={}&version={}">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+                    form.manifest, form.version, target_path, e, form.manifest, form.version
+                ))
+                .into_response();
+            }
+        };
+
+        let content = String::from_utf8_lossy(&bytes).to_string();
+        let (blocking, allowed) = scan_unresolved_tokens(&content);
+        if !blocking.is_empty() {
+            let edit_url = format!(
+                "/deployments/edit?manifest={}&version={}&file_path={}&edit=true",
+                form.manifest, form.version, target_path
+            );
+            let tokens_html = blocking
+                .iter()
+                .map(|t| format!("<li><code>{{{{ {} }}}}</code></li>", t))
+                .collect::<Vec<_>>()
+                .join("");
+            let allowed_html = if allowed.is_empty() {
+                "".to_string()
+            } else {
+                format!(
+                    "<p class=\"mb-2\">Allowed unresolved tokens (will be populated by agent): {}</p>",
+                    allowed
+                        .iter()
+                        .map(|t| format!("<code>{{{{ {} }}}}</code>", t))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            };
+
+            return Html(format!(
+                r#"<!DOCTYPE html>
+<html>
+<head>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Cannot Seal Deployment</h4>
+            <p>File <code>{}</code> still contains unresolved placeholders.</p>
+            {}
+            <p class="mb-2">Please edit the file and replace/remove these tokens:</p>
+            <ul class="mb-3">{}</ul>
+            <a class="btn btn-primary" href="{}"><i class="bi bi-pencil"></i> Edit {}</a>
+            <a class="btn btn-secondary ms-2" href="/deployments/view?manifest={}&version={}">Back</a>
+        </div>
+    </div>
+</body>
+</html>"#,
+                target_path, allowed_html, tokens_html, edit_url, target_path, form.manifest, form.version
+            ))
+            .into_response();
+        }
+    }
     
     // Create manifest snapshot
     let manifest_snapshot = manifest.to_snapshot(&form.manifest, &form.version);
@@ -2487,13 +5308,15 @@ async fn bulk_publish_deployment(
     }
     
     // Get manifest info for profile and source bucket
-    let (profile, source_bucket_name, source_bucket_config) = {
+    let (profile, source_bucket_name, source_bucket_config, service_owner, service_group) = {
         let config = state.read().unwrap();
         match config.manifests.get(&form.manifest) {
             Some(manifest) => {
                 let profile = manifest.profile.to_string();
+                let service_owner = manifest.service_owner.clone();
+                let service_group = manifest.service_group.clone();
                 match config.buckets.get(&manifest.bucket) {
-                    Some(bc) => (profile, bc.bucket_name.clone(), bc.clone()),
+                    Some(bc) => (profile, bc.bucket_name.clone(), bc.clone(), service_owner, service_group),
                     None => return Redirect::to("/deployments").into_response(),
                 }
             }
@@ -2728,34 +5551,94 @@ async fn bulk_publish_deployment(
                 }
             }
             
-            // Snapshot overrides manifest to versions/<ver>/overrides_manifest.json (best-effort)
-            let overrides_manifest_src_base = format!("cells/{}/{}/overrides_manifest.json", node_id, cell_id);
-            let overrides_manifest_src = cell_bucket_config.full_key(&overrides_manifest_src_base);
+            // Snapshot overrides manifest to versions/<ver>/overrides_manifest.json (repeatable):
+            // store fully resolved owner/group/mode so the version doesn't depend on agent default rules.
+            let overrides_manifest_src_base =
+                format!("cells/{}/{}/overrides_manifest.json", node_id, cell_id);
+            let overrides_manifest_src =
+                cell_bucket_config.full_key(&overrides_manifest_src_base);
             let overrides_manifest_dest_base = format!("{}overrides_manifest.json", dest_prefix_base);
-            let overrides_manifest_dest = cell_bucket_config.full_key(&overrides_manifest_dest_base);
-            let copy_source = format!("{}/{}", cell_bucket_name, overrides_manifest_src);
-            let copy_op = format!("copy_overrides_manifest_to_version: {} -> {}/{}", copy_source, cell_bucket_name, overrides_manifest_dest);
-            let _ = retry_s3_operation(
-                &copy_op,
+            let overrides_manifest_dest =
+                cell_bucket_config.full_key(&overrides_manifest_dest_base);
+
+            let get_op = format!("get_overrides_manifest_for_snapshot: {}", overrides_manifest_src);
+            if let Ok(obj) = retry_s3_operation(
+                &get_op,
                 retry_count,
                 retry_delay_ms,
                 || {
                     let client = dest_client.clone();
                     let bucket = cell_bucket_name.clone();
-                    let dest = overrides_manifest_dest.clone();
-                    let src = copy_source.clone();
-                    async move {
-                        client
-                            .copy_object()
-                            .bucket(&bucket)
-                            .key(&dest)
-                            .copy_source(&src)
-                            .send()
-                            .await
-                    }
+                    let key = overrides_manifest_src.clone();
+                    async move { client.get_object().bucket(&bucket).key(&key).send().await }
                 },
             )
-            .await;
+            .await
+            {
+                if let Ok(data) = obj.body.collect().await {
+                    if let Ok(live) =
+                        serde_json::from_slice::<CellOverridesManifest>(&data.to_vec())
+                    {
+                        let mut files: Vec<ResolvedCellOverrideFile> = Vec::new();
+                        for f in live.files {
+                            let owner = f
+                                .owner
+                                .as_deref()
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or(service_owner.trim())
+                                .to_string();
+                            let group = f
+                                .group
+                                .as_deref()
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or(service_group.trim())
+                                .to_string();
+                            let mode = f
+                                .mode
+                                .as_deref()
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or(default_override_mode(&f.path, &f.file_type))
+                                .to_string();
+                            files.push(ResolvedCellOverrideFile {
+                                path: f.path,
+                                file_type: f.file_type,
+                                owner,
+                                group,
+                                mode,
+                            });
+                        }
+                        let resolved = ResolvedCellOverridesManifest { files };
+                        if let Ok(content) = serde_json::to_string_pretty(&resolved) {
+                            let put_op =
+                                format!("put_overrides_manifest_snapshot: {}", overrides_manifest_dest);
+                            let _ = retry_s3_operation(
+                                &put_op,
+                                retry_count,
+                                retry_delay_ms,
+                                || {
+                                    let client = dest_client.clone();
+                                    let bucket = cell_bucket_name.clone();
+                                    let key = overrides_manifest_dest.clone();
+                                    let body = content.clone();
+                                    async move {
+                                        client
+                                            .put_object()
+                                            .bucket(&bucket)
+                                            .key(&key)
+                                            .body(ByteStream::from(body.into_bytes()))
+                                            .send()
+                                            .await
+                                    }
+                                },
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
         }
         
         // Create metadata file (JSON format) in cell's bucket
@@ -3241,26 +6124,6 @@ async fn clone_version(
 // create_initial_deployment removed - initial deployments start empty
 // manifest.json is created only when user finishes the deployment
 
-async fn create_s3_client(config: &BucketConfig) -> Client {
-    let credentials = Credentials::new(
-        &config.access_key,
-        &config.secret_key,
-        None,
-        None,
-        "static",
-    );
-    
-    let s3_config = Builder::new()
-        .region(Region::new("us-east-1"))
-        .endpoint_url(&config.endpoint)
-        .credentials_provider(credentials)
-        .force_path_style(config.path_style)
-        .behavior_version_latest()
-        .build();
-    
-    Client::from_conf(s3_config)
-}
-
 // ========== Cell Management Handlers ==========
 
 #[derive(Template)]
@@ -3575,13 +6438,238 @@ async fn delete_cell(
     AxumState(state): AxumState<AppState>,
     Form(form): Form<DeleteCellForm>,
 ) -> impl IntoResponse {
-    let mut config = state.write().unwrap();
-    config.cells.remove(&form.cell_key);
-    
-    if let Err(e) = save_config(&config) {
-        eprintln!("Failed to save config: {}", e);
+    // Parse cell_key: "<node_id>/<cell_id>"
+    let parts: Vec<&str> = form.cell_key.split('/').collect();
+    if parts.len() != 2 {
+        return Html("<div class=\"container mt-4\"><div class=\"alert alert-danger\">Invalid cell key</div><a href=\"/cells\">Back</a></div>".to_string()).into_response();
     }
-    
+    let node_id = parts[0].to_string();
+    let cell_id = parts[1].to_string();
+
+    // Snapshot cell + bucket config before awaiting.
+    let (bucket_name, bucket_cfg, retry_count, retry_delay_ms) = {
+        let cfg = state.read().unwrap();
+        let cell = match cfg.cells.get(&form.cell_key) {
+            Some(c) => c.clone(),
+            None => return Redirect::to("/cells").into_response(),
+        };
+        let bc = match cfg.buckets.get(&cell.bucket) {
+            Some(bc) => bc.clone(),
+            None => {
+                return Html("<div class=\"container mt-4\"><div class=\"alert alert-danger\">Bucket not configured for this cell</div><a href=\"/cells\">Back</a></div>".to_string()).into_response();
+            }
+        };
+        (bc.bucket_name.clone(), bc, cfg.s3_retry_count, cfg.s3_retry_delay_ms)
+    };
+
+    // Move S3 folder: <root>/cells/<node>/<cell>/ -> <root>/cell_recycle/<node>/<cell>/<yyyyMMdd-HHmmss-SSS>/
+    let client = create_s3_client(&bucket_cfg).await;
+    let ts = chrono::Local::now().format("%Y%m%d-%H%M%S-%3f").to_string();
+
+    let src_prefix_base = format!("cells/{}/{}/", node_id, cell_id);
+    let dst_prefix_base = format!("cell_recycle/{}/{}/{}/", node_id, cell_id, ts);
+    let src_prefix = bucket_cfg.full_key(&src_prefix_base);
+    let dst_prefix = bucket_cfg.full_key(&dst_prefix_base);
+
+    // Phase 1: paginate + collect all source keys
+    let mut continuation: Option<String> = None;
+    let mut src_keys: Vec<String> = Vec::new();
+    loop {
+        let op = format!("cell_delete:list:{}:{}", bucket_name, src_prefix);
+        let res = retry_s3_operation(
+            &op,
+            retry_count,
+            retry_delay_ms,
+            || {
+                let client = client.clone();
+                let bucket = bucket_name.clone();
+                let prefix = src_prefix.clone();
+                let token = continuation.clone();
+                async move {
+                    let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
+                    if let Some(t) = token {
+                        req = req.continuation_token(t);
+                    }
+                    req.send().await
+                }
+            },
+        )
+        .await;
+
+        let output = match res {
+            Ok(o) => o,
+            Err(e) => {
+                return Html(format!(
+                    "<div class=\"container mt-4\"><div class=\"alert alert-danger\">Failed to list cell objects for deletion: {:?}</div><a href=\"/cells\">Back</a></div>",
+                    e
+                ))
+                .into_response();
+            }
+        };
+
+        for o in output.contents.unwrap_or_default() {
+            if let Some(k) = o.key {
+                src_keys.push(k);
+            }
+        }
+
+        if output.is_truncated.unwrap_or(false) {
+            continuation = output.next_continuation_token;
+        } else {
+            break;
+        }
+    }
+
+    // Phase 2: copy everything (paginated already done), and verify each copy via head_object.
+    for key in &src_keys {
+        let rel = key.strip_prefix(&src_prefix).unwrap_or(key);
+        let new_key = format!("{}{}", dst_prefix, rel);
+        let copy_source = format!("{}/{}", bucket_name, key);
+
+        let op = format!("cell_delete:copy:{}->{}", key, new_key);
+        if let Err(e) = retry_s3_operation(
+            &op,
+            retry_count,
+            retry_delay_ms,
+            || {
+                let client = client.clone();
+                let bucket = bucket_name.clone();
+                let copy_source = copy_source.clone();
+                let new_key = new_key.clone();
+                async move {
+                    client
+                        .copy_object()
+                        .bucket(&bucket)
+                        .copy_source(copy_source)
+                        .key(new_key)
+                        .send()
+                        .await
+                }
+            },
+        )
+        .await
+        {
+            return Html(format!(
+                "<div class=\"container mt-4\"><div class=\"alert alert-danger\">Failed to archive cell object: {:?}</div><a href=\"/cells\">Back</a></div>",
+                e
+            ))
+            .into_response();
+        }
+
+        // Verify copy exists before deleting originals.
+        let op = format!("cell_delete:verify_copy:{}", new_key);
+        if let Err(e) = retry_s3_operation(
+            &op,
+            retry_count,
+            retry_delay_ms,
+            || {
+                let client = client.clone();
+                let bucket = bucket_name.clone();
+                let k = new_key.clone();
+                async move { client.head_object().bucket(&bucket).key(&k).send().await }
+            },
+        )
+        .await
+        {
+            return Html(format!(
+                "<div class=\"container mt-4\"><div class=\"alert alert-danger\">Archive verification failed (copied object missing): {:?}</div><a href=\"/cells\">Back</a></div>",
+                e
+            ))
+            .into_response();
+        }
+    }
+
+    // Phase 2b: verify destination keyset matches exactly (same relative paths).
+    let mut dst_rel: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut dst_cont: Option<String> = None;
+    loop {
+        let op = format!("cell_delete:verify_list_dst:{}:{}", bucket_name, dst_prefix);
+        let res = retry_s3_operation(
+            &op,
+            retry_count,
+            retry_delay_ms,
+            || {
+                let client = client.clone();
+                let bucket = bucket_name.clone();
+                let prefix = dst_prefix.clone();
+                let token = dst_cont.clone();
+                async move {
+                    let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
+                    if let Some(t) = token {
+                        req = req.continuation_token(t);
+                    }
+                    req.send().await
+                }
+            },
+        )
+        .await;
+        let out = match res {
+            Ok(o) => o,
+            Err(e) => {
+                return Html(format!(
+                    "<div class=\"container mt-4\"><div class=\"alert alert-danger\">Archive verification failed (list dst): {:?}</div><a href=\"/cells\">Back</a></div>",
+                    e
+                ))
+                .into_response();
+            }
+        };
+        for o in out.contents.unwrap_or_default() {
+            if let Some(k) = o.key {
+                let rel = k.strip_prefix(&dst_prefix).unwrap_or(&k).to_string();
+                dst_rel.insert(rel);
+            }
+        }
+        if out.is_truncated.unwrap_or(false) {
+            dst_cont = out.next_continuation_token;
+        } else {
+            break;
+        }
+    }
+    let mut src_rel: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for k in &src_keys {
+        let rel = k.strip_prefix(&src_prefix).unwrap_or(k).to_string();
+        src_rel.insert(rel);
+    }
+    if dst_rel != src_rel {
+        return Html(
+            "<div class=\"container mt-4\"><div class=\"alert alert-danger\">Archive verification failed (destination does not match source). No originals were deleted.</div><a href=\"/cells\">Back</a></div>"
+                .to_string(),
+        )
+        .into_response();
+    }
+
+    // Phase 3: delete originals only after verification succeeds.
+    for key in &src_keys {
+        let op = format!("cell_delete:delete:{}", key);
+        if let Err(e) = retry_s3_operation(
+            &op,
+            retry_count,
+            retry_delay_ms,
+            || {
+                let client = client.clone();
+                let bucket = bucket_name.clone();
+                let key = key.clone();
+                async move { client.delete_object().bucket(&bucket).key(&key).send().await }
+            },
+        )
+        .await
+        {
+            return Html(format!(
+                "<div class=\"container mt-4\"><div class=\"alert alert-danger\">Archive completed but failed to delete some original objects: {:?}</div><a href=\"/cells\">Back</a></div>",
+                e
+            ))
+            .into_response();
+        }
+    }
+
+    // Remove cell from controller config only after archive succeeded.
+    {
+        let mut cfg = state.write().unwrap();
+        cfg.cells.remove(&form.cell_key);
+        save_config(&cfg).ok();
+    }
+
+    // Best-effort: show success message via redirect.
     Redirect::to("/cells").into_response()
 }
 
@@ -3664,12 +6752,6 @@ async fn view_cell_status(
 
 // ========== Cell Override Handlers ==========
 
-// Default values for override files without manifest metadata
-const DEFAULT_OVERRIDE_OWNER: &str = "root";
-const DEFAULT_OVERRIDE_GROUP: &str = "root";
-const DEFAULT_OVERRIDE_MODE_FILE: &str = "0644";
-const DEFAULT_OVERRIDE_MODE_FOLDER: &str = "0755";
-
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct CellOverridesManifest {
     files: Vec<CellOverrideFile>,
@@ -3677,6 +6759,23 @@ struct CellOverridesManifest {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct CellOverrideFile {
+    path: String,
+    file_type: FileType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ResolvedCellOverridesManifest {
+    files: Vec<ResolvedCellOverrideFile>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ResolvedCellOverrideFile {
     path: String,
     file_type: FileType,
     owner: String,
@@ -3700,9 +6799,10 @@ struct OverrideFileInfo {
     last_modified: String,
     is_folder: bool,
     file_type: String,
-    owner: String,
-    group: String,
-    mode: String,
+    owner_group: Option<String>,
+    mode: Option<String>,
+    owner_group_str: String,
+    mode_str: String,
 }
 
 // Load cell overrides manifest
@@ -3867,16 +6967,23 @@ async fn cell_overrides_page(
                     if !relative_path.is_empty() {
                         let is_folder = relative_path.ends_with('/');
                         
-                        // Get metadata from manifest or use defaults
-                        let (file_type, owner, group, mode) = if let Some(meta) = metadata_map.get(&relative_path) {
-                            (meta.file_type.to_string(), meta.owner.clone(), meta.group.clone(), meta.mode.clone())
+                        // Get metadata from manifest (customization is optional)
+                        let (file_type, owner_group, mode) = if let Some(meta) = metadata_map.get(&relative_path) {
+                            let og = match (meta.owner.as_deref(), meta.group.as_deref()) {
+                                (Some(o), Some(g)) if !o.trim().is_empty() && !g.trim().is_empty() => {
+                                    Some(format!("{}:{}", o.trim(), g.trim()))
+                                }
+                                _ => None,
+                            };
+                            let m = meta.mode.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string());
+                            (meta.file_type.to_string(), og, m)
                         } else {
-                            // Default values if not in manifest
                             let ft = if is_folder { "folder" } else { "binary" };
-                            let mode = if is_folder { DEFAULT_OVERRIDE_MODE_FOLDER } else { DEFAULT_OVERRIDE_MODE_FILE };
-                            (ft.to_string(), DEFAULT_OVERRIDE_OWNER.to_string(), DEFAULT_OVERRIDE_GROUP.to_string(), mode.to_string())
+                            (ft.to_string(), None, None)
                         };
                         
+                        let owner_group_str = owner_group.clone().unwrap_or_default();
+                        let mode_str = mode.clone().unwrap_or_default();
                         overrides.push(OverrideFileInfo {
                             path: relative_path.clone(),
                             size: obj.size.unwrap_or(0),
@@ -3885,9 +6992,10 @@ async fn cell_overrides_page(
                                 .unwrap_or_default(),
                             is_folder,
                             file_type,
-                            owner,
-                            group,
+                            owner_group,
                             mode,
+                            owner_group_str,
+                            mode_str,
                         });
                     }
                 }
@@ -3931,9 +7039,9 @@ async fn upload_cell_override(
     let mut source_type = String::from("upload");
     let mut staging_path = String::new();
     let mut file_type = String::from("binary");
-    let mut owner = String::from("root");
-    let mut group = String::from("root");
-    let mut mode = String::from("0644");
+    let mut owner = String::new();
+    let mut group = String::new();
+    let mut mode = String::new();
     let mut file_data = Vec::new();
     
     while let Ok(Some(field)) = multipart.next_field().await {
@@ -4119,6 +7227,41 @@ async fn upload_cell_override(
         "folder" => FileType::Folder,
         _ => FileType::Binary,
     };
+
+    // Normalize optional customization: either full (owner+group+mode) or empty.
+    let owner_t = owner.trim().to_string();
+    let group_t = group.trim().to_string();
+    let mode_t = mode.trim().to_string();
+    let has_any = !owner_t.is_empty() || !group_t.is_empty() || !mode_t.is_empty();
+    if has_any && (owner_t.is_empty() || group_t.is_empty() || mode_t.is_empty()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html("<html><head><meta http-equiv='refresh' content='5;url=/cells'></head><body>Customization must include owner + group + mode, or be fully empty.</body></html>".to_string()),
+        )
+            .into_response();
+    }
+    if has_any {
+        if let Err(e) = validate_service_identity(&owner_t, &group_t) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Html(format!(
+                    "<html><head><meta http-equiv='refresh' content='5;url=/cells'></head><body>{}</body></html>",
+                    e
+                )),
+            )
+                .into_response();
+        }
+        if let Err(e) = parse_mode_octal(&mode_t) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Html(format!(
+                    "<html><head><meta http-equiv='refresh' content='5;url=/cells'></head><body>{}</body></html>",
+                    e
+                )),
+            )
+                .into_response();
+        }
+    }
     
     // Remove existing entry if present
     manifest.files.retain(|f| f.path != normalized_file_path);
@@ -4127,9 +7270,9 @@ async fn upload_cell_override(
     manifest.files.push(CellOverrideFile {
         path: normalized_file_path.clone(),
         file_type: ft,
-        owner: owner.clone(),
-        group: group.clone(),
-        mode: mode.clone(),
+        owner: if has_any { Some(owner_t) } else { None },
+        group: if has_any { Some(group_t) } else { None },
+        mode: if has_any { Some(mode_t) } else { None },
     });
     
     // Save manifest
@@ -4340,8 +7483,11 @@ async fn save_cell_override(
 struct UpdateCellOverrideMetaForm {
     file_path: String,
     file_type: String,
+    #[serde(default)]
     owner: String,
+    #[serde(default)]
     group: String,
+    #[serde(default)]
     mode: String,
 }
 
@@ -4379,21 +7525,56 @@ async fn update_cell_override_meta(
         "folder" => FileType::Folder,
         _ => FileType::Binary,
     };
+
+    // Normalize optional customization: either full (owner+group+mode) or empty.
+    let owner_t = form.owner.trim().to_string();
+    let group_t = form.group.trim().to_string();
+    let mode_t = form.mode.trim().to_string();
+    let has_any = !owner_t.is_empty() || !group_t.is_empty() || !mode_t.is_empty();
+    if has_any && (owner_t.is_empty() || group_t.is_empty() || mode_t.is_empty()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html("<html><head><meta http-equiv='refresh' content='5;url=/cells'></head><body>Customization must include owner + group + mode, or be fully empty.</body></html>".to_string()),
+        )
+            .into_response();
+    }
+    if has_any {
+        if let Err(e) = validate_service_identity(&owner_t, &group_t) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Html(format!(
+                    "<html><head><meta http-equiv='refresh' content='5;url=/cells'></head><body>{}</body></html>",
+                    e
+                )),
+            )
+                .into_response();
+        }
+        if let Err(e) = parse_mode_octal(&mode_t) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Html(format!(
+                    "<html><head><meta http-equiv='refresh' content='5;url=/cells'></head><body>{}</body></html>",
+                    e
+                )),
+            )
+                .into_response();
+        }
+    }
     
     // Find and update existing entry, or add new one
     if let Some(existing) = manifest.files.iter_mut().find(|f| f.path == form.file_path) {
         existing.file_type = ft;
-        existing.owner = form.owner.clone();
-        existing.group = form.group.clone();
-        existing.mode = form.mode.clone();
+        existing.owner = if has_any { Some(owner_t) } else { None };
+        existing.group = if has_any { Some(group_t) } else { None };
+        existing.mode = if has_any { Some(mode_t) } else { None };
     } else {
         // File not in manifest yet (legacy file), add it
         manifest.files.push(CellOverrideFile {
             path: form.file_path.clone(),
             file_type: ft,
-            owner: form.owner.clone(),
-            group: form.group.clone(),
-            mode: form.mode.clone(),
+            owner: if has_any { Some(owner_t) } else { None },
+            group: if has_any { Some(group_t) } else { None },
+            mode: if has_any { Some(mode_t) } else { None },
         });
     }
     
@@ -4605,8 +7786,18 @@ async fn publish_deployment_to_cell(
     Form(form): Form<PublishToCellForm>,
 ) -> impl IntoResponse {
     // Clone config data before await - get both manifest and cell bucket configs
-    let (source_manifest_name, source_bucket_name, source_bucket_config, 
-         cell_bucket_name, cell_bucket_config, retry_count, retry_delay_ms, profile) = {
+    let (
+        source_manifest_name,
+        source_bucket_name,
+        source_bucket_config,
+        cell_bucket_name,
+        cell_bucket_config,
+        retry_count,
+        retry_delay_ms,
+        profile,
+        service_owner,
+        service_group,
+    ) = {
         let config = state.read().unwrap();
         let cell_key = format!("{}/{}", node_id, cell_id);
         match config.cells.get(&cell_key) {
@@ -4616,6 +7807,8 @@ async fn publish_deployment_to_cell(
                     Some(m) => m,
                     None => return Html(format!("<h1>Manifest not found: {}</h1>", cell.manifest)).into_response(),
                 };
+                let service_owner = manifest.service_owner.clone();
+                let service_group = manifest.service_group.clone();
                     
                 // Get manifest's bucket config (source)
                 let (manifest_bucket_name, manifest_bucket_config, profile) = {
@@ -4630,7 +7823,7 @@ async fn publish_deployment_to_cell(
                 match config.buckets.get(&cell.bucket) {
                     Some(bc) => (cell.manifest.clone(), manifest_bucket_name, manifest_bucket_config,
                                 bc.bucket_name.clone(), bc.clone(),
-                                config.s3_retry_count, config.s3_retry_delay_ms, profile),
+                                config.s3_retry_count, config.s3_retry_delay_ms, profile, service_owner, service_group),
                     None => return Html("<h1>Cell bucket not found</h1>".to_string()).into_response(),
                 }
             }
@@ -4844,34 +8037,90 @@ async fn publish_deployment_to_cell(
             }
         }
 
-        // Snapshot overrides manifest to versions/<ver>/overrides_manifest.json (best-effort)
-        let overrides_manifest_src_base = format!("cells/{}/{}/overrides_manifest.json", node_id, cell_id);
+        // Snapshot overrides manifest to versions/<ver>/overrides_manifest.json (repeatable):
+        // store fully resolved owner/group/mode so the version doesn't depend on agent default rules.
+        let overrides_manifest_src_base =
+            format!("cells/{}/{}/overrides_manifest.json", node_id, cell_id);
         let overrides_manifest_src = cell_bucket_config.full_key(&overrides_manifest_src_base);
         let overrides_manifest_dest_base = format!("{}overrides_manifest.json", dest_prefix_base);
         let overrides_manifest_dest = cell_bucket_config.full_key(&overrides_manifest_dest_base);
-        let copy_source = format!("{}/{}", cell_bucket_name, overrides_manifest_src);
-        let copy_op = format!("copy_overrides_manifest_to_version: {} -> {}/{}", copy_source, cell_bucket_name, overrides_manifest_dest);
-        let _ = retry_s3_operation(
-            &copy_op,
+
+        let get_op = format!("get_overrides_manifest_for_snapshot: {}", overrides_manifest_src);
+        if let Ok(obj) = retry_s3_operation(
+            &get_op,
             retry_count,
             retry_delay_ms,
             || {
                 let client = dest_client.clone();
                 let bucket = cell_bucket_name.clone();
-                let dest = overrides_manifest_dest.clone();
-                let src = copy_source.clone();
-                async move {
-                    client
-                        .copy_object()
-                        .bucket(&bucket)
-                        .key(&dest)
-                        .copy_source(&src)
-                        .send()
-                        .await
-                }
+                let key = overrides_manifest_src.clone();
+                async move { client.get_object().bucket(&bucket).key(&key).send().await }
             },
         )
-        .await;
+        .await
+        {
+            if let Ok(data) = obj.body.collect().await {
+                if let Ok(live) = serde_json::from_slice::<CellOverridesManifest>(&data.to_vec()) {
+                    let mut files: Vec<ResolvedCellOverrideFile> = Vec::new();
+                    for f in live.files {
+                        let owner = f
+                            .owner
+                            .as_deref()
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(service_owner.trim())
+                            .to_string();
+                        let group = f
+                            .group
+                            .as_deref()
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(service_group.trim())
+                            .to_string();
+                        let mode = f
+                            .mode
+                            .as_deref()
+                            .map(|s| s.trim())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(default_override_mode(&f.path, &f.file_type))
+                            .to_string();
+                        files.push(ResolvedCellOverrideFile {
+                            path: f.path,
+                            file_type: f.file_type,
+                            owner,
+                            group,
+                            mode,
+                        });
+                    }
+                    let resolved = ResolvedCellOverridesManifest { files };
+                    if let Ok(content) = serde_json::to_string_pretty(&resolved) {
+                        let put_op =
+                            format!("put_overrides_manifest_snapshot: {}", overrides_manifest_dest);
+                        let _ = retry_s3_operation(
+                            &put_op,
+                            retry_count,
+                            retry_delay_ms,
+                            || {
+                                let client = dest_client.clone();
+                                let bucket = cell_bucket_name.clone();
+                                let key = overrides_manifest_dest.clone();
+                                let body = content.clone();
+                                async move {
+                                    client
+                                        .put_object()
+                                        .bucket(&bucket)
+                                        .key(&key)
+                                        .body(ByteStream::from(body.into_bytes()))
+                                        .send()
+                                        .await
+                                }
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
     }
     
     // Create metadata file (JSON format) - contains manifest_name and profile (in cell's bucket)

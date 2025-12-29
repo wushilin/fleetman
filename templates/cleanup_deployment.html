@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+
+{% block title %}Cleanup Deployment - Fleetman{% endblock %}
+{% block nav_deployments %}active{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h1 class="mb-0">Cleanup Deployment</h1>
+  <a class="btn btn-outline-secondary" href="/deployments"><i class="bi bi-arrow-left"></i> Back</a>
+</div>
+
+<div class="alert alert-warning">
+  <strong>Pre-check:</strong> this will delete deployments whose <code>manifest</code> no longer exists in Fleetman config.
+</div>
+
+{% if orphan_versions.is_empty() %}
+  <p class="text-muted">No orphan deployments found.</p>
+{% else %}
+  <div class="alert alert-info">
+    Found <strong>{{ orphan_manifests_count }}</strong> orphan manifest(s), <strong>{{ orphan_versions_count }}</strong> version(s),
+    total <strong>{{ orphan_objects_total }}</strong> object(s).
+  </div>
+
+  <div class="table-responsive mb-3">
+    <table class="table table-sm table-striped">
+      <thead>
+        <tr>
+          <th>Bucket</th>
+          <th>Manifest</th>
+          <th>Version</th>
+          <th>Objects</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in orphan_versions %}
+        <tr>
+          <td><code>{{ row.bucket_display }}</code></td>
+          <td><code>{{ row.manifest_name }}</code></td>
+          <td><code>{{ row.version }}</code></td>
+          <td><code>{{ row.object_count }}</code></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <form method="POST" action="/deployments/cleanup" onsubmit="return confirm('Delete these orphan deployments now? This is permanent.');">
+    <button class="btn btn-danger">
+      <i class="bi bi-trash3"></i> Yes, delete
+    </button>
+  </form>
+{% endif %}
+
+{% endblock %}
+
+

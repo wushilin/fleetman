@@ -24,11 +24,31 @@
             
             <div class="mb-3">
                 <label class="form-label">Deployment Profile</label>
-                <select class="form-select" name="profile" required>
-                    <option value="supervisor" {% match manifest.profile %}{% when DeploymentProfile::Supervisor %}selected{% when _ %}{% endmatch %}>Supervisor</option>
+                <select class="form-select" name="profile" id="profileSelect" required onchange="handleProfileChange()">
+                    {% match manifest.profile %}
+                    {% when DeploymentProfile::Supervisor %}
+                    <option value="supervisor" selected disabled>Supervisor (deprecated)</option>
+                    {% when _ %}
+                    {% endmatch %}
                     <option value="systemd" {% match manifest.profile %}{% when DeploymentProfile::Systemd %}selected{% when _ %}{% endmatch %}>Systemd</option>
+                    <option value="processmaster" {% match manifest.profile %}{% when DeploymentProfile::ProcessMaster %}selected{% when _ %}{% endmatch %}>ProcessMaster</option>
                     <option value="deploy" {% match manifest.profile %}{% when DeploymentProfile::Deploy %}selected{% when _ %}{% endmatch %}>Deploy (files only)</option>
                 </select>
+                {% match manifest.profile %}
+                {% when DeploymentProfile::Supervisor %}
+                <small class="form-text text-warning">Supervisor profile is deprecated and cannot be newly created; please migrate to processmaster or systemd.</small>
+                {% when _ %}
+                {% endmatch %}
+            </div>
+
+            <div class="mb-3" id="resourceProfileContainer" style="display: none;">
+                <label class="form-label">Resource Profile</label>
+                <select class="form-select" name="resource_profile" id="resourceProfileSelect">
+                    {% for rp in resource_profiles %}
+                    <option value="{{ rp }}" {% if rp.as_str() == manifest.resource_profile.as_str() %}selected{% endif %}>{{ rp }}</option>
+                    {% endfor %}
+                </select>
+                <small class="form-text text-muted">Required for <code>systemd</code> and <code>processmaster</code> manifests.</small>
             </div>
             
             <div class="mb-3">
@@ -44,6 +64,38 @@
                     {% endfor %}
                     {% endif %}
                 </select>
+            </div>
+
+            <div class="row">
+                <div class="col-md-4 mb-3">
+                    <label class="form-label">Service Owner</label>
+                    <input type="text" class="form-control" name="service_owner" value="{{ manifest.service_owner }}" placeholder="root" required>
+                    <small class="form-text text-muted">Default owner for the service (run-as identity + default ownership for files). Default: <code>root</code>.</small>
+                </div>
+                <div class="col-md-4 mb-3">
+                    <label class="form-label">Service Group</label>
+                    <input type="text" class="form-control" name="service_group" value="{{ manifest.service_group }}" placeholder="root" required>
+                    <small class="form-text text-muted">Default group for the service (run-as identity + default ownership for files). Default: <code>root</code>.</small>
+                </div>
+                <div class="col-md-4 mb-3">
+                    <label class="form-label">Service Folder Mode</label>
+                    <input type="text" class="form-control" name="service_folder_mode" value="{{ manifest.service_folder_mode }}" placeholder="0700">
+                    <small class="form-text text-muted">Octal mode for the deployed service directory. Default: <code>0700</code>.</small>
+                </div>
+            </div>
+            <div class="mb-3">
+                <label class="form-label">Service Folder Ownership (optional)</label>
+                <div class="d-flex align-items-center gap-2">
+                    <button type="button" class="btn btn-sm btn-outline-secondary" onclick="openServiceFolderMetaModal()">
+                        Customize Service Folder Ownership
+                    </button>
+                    <div id="serviceFolderMetaBadges"></div>
+                </div>
+                <small class="form-text text-muted">
+                    If not customized, the service folder ownership defaults to <code>service_owner:service_group</code>.
+                </small>
+                <input type="hidden" name="service_folder_owner" id="serviceFolderOwnerHidden" value="{{ manifest.service_folder_owner.as_deref().unwrap_or("") }}">
+                <input type="hidden" name="service_folder_group" id="serviceFolderGroupHidden" value="{{ manifest.service_folder_group.as_deref().unwrap_or("") }}">
             </div>
             
             <div class="mb-3">
@@ -65,19 +117,14 @@
                                 </select>
                             </div>
                         </div>
-                        <div class="row mb-2">
-                            <div class="col-md-4">
-                                <label class="form-label small">Owner</label>
-                                <input type="text" class="form-control form-control-sm file-owner-input" value="{{ file.owner }}" placeholder="root">
-                            </div>
-                            <div class="col-md-4">
-                                <label class="form-label small">Group</label>
-                                <input type="text" class="form-control form-control-sm file-group-input" value="{{ file.group }}" placeholder="root">
-                            </div>
-                            <div class="col-md-4">
-                                <label class="form-label small">Mode</label>
-                                <input type="text" class="form-control form-control-sm file-mode-input" value="{{ file.mode }}" placeholder="0600">
-                            </div>
+                        <div class="d-flex align-items-center gap-2 mb-2">
+                            <button type="button" class="btn btn-sm btn-outline-secondary file-customize-btn" onclick="openFileMetaModal(this)">
+                                Customize
+                            </button>
+                            <div class="file-meta-badges"></div>
+                            <input type="hidden" class="file-owner-hidden" value="{{ file.owner.as_deref().unwrap_or("") }}">
+                            <input type="hidden" class="file-group-hidden" value="{{ file.group.as_deref().unwrap_or("") }}">
+                            <input type="hidden" class="file-mode-hidden" value="{{ file.mode.as_deref().unwrap_or("") }}">
                         </div>
                         <button type="button" class="btn btn-sm btn-danger remove-file" onclick="removeFile(this)">Remove</button>
                     </div>
@@ -131,24 +178,141 @@
     </div>
 </div>
 
+<!-- File Meta Customize Modal -->
+<div class="modal fade" id="fileMetaModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Customize File Metadata</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="mb-2">
+                    <label class="form-label">Override (format: <code>user:group:0700</code>)</label>
+                    <input type="text" class="form-control" id="fileMetaInput" placeholder="root:root:0700">
+                    <div class="form-text">Click the badge “X” to remove customization later.</div>
+                </div>
+                <div id="fileMetaError" class="alert alert-danger" style="display:none; margin-bottom:0;"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" onclick="applyFileMetaFromModal()">Apply</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Service Folder Ownership Customize Modal -->
+<div class="modal fade" id="serviceFolderMetaModal" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Customize Service Folder Ownership</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="mb-2">
+                    <label class="form-label">Override (format: <code>user:group</code>)</label>
+                    <input type="text" class="form-control" id="serviceFolderMetaInput" placeholder="root:root">
+                    <div class="form-text">Leave blank to cancel. Click the badge “X” to remove customization later.</div>
+                </div>
+                <div id="serviceFolderMetaError" class="alert alert-danger" style="display:none; margin-bottom:0;"></div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button type="button" class="btn btn-primary" onclick="applyServiceFolderMetaFromModal()">Apply</button>
+            </div>
+        </div>
+    </div>
+</div>
+
 <script>
+let __activeFileEntryForMeta = null;
+
+function openServiceFolderMetaModal() {
+    const owner = document.getElementById('serviceFolderOwnerHidden')?.value || '';
+    const group = document.getElementById('serviceFolderGroupHidden')?.value || '';
+    const input = document.getElementById('serviceFolderMetaInput');
+    const err = document.getElementById('serviceFolderMetaError');
+    err.style.display = 'none';
+    input.value = (owner && group) ? `${owner}:${group}` : '';
+    const modal = new bootstrap.Modal(document.getElementById('serviceFolderMetaModal'));
+    modal.show();
+}
+
+function applyServiceFolderMetaFromModal() {
+    const raw = (document.getElementById('serviceFolderMetaInput').value || '').trim();
+    const err = document.getElementById('serviceFolderMetaError');
+    err.style.display = 'none';
+    const parts = raw.split(':');
+    if (parts.length !== 2) {
+        err.textContent = 'Invalid format. Expected: user:group';
+        err.style.display = 'block';
+        return;
+    }
+    const user = parts[0].trim();
+    const group = parts[1].trim();
+    if (!user || /\s/.test(user)) {
+        err.textContent = 'Invalid user (no whitespace).';
+        err.style.display = 'block';
+        return;
+    }
+    if (!group || /\s/.test(group)) {
+        err.textContent = 'Invalid group (no whitespace).';
+        err.style.display = 'block';
+        return;
+    }
+    document.getElementById('serviceFolderOwnerHidden').value = user;
+    document.getElementById('serviceFolderGroupHidden').value = group;
+    renderServiceFolderMetaBadge();
+    bootstrap.Modal.getInstance(document.getElementById('serviceFolderMetaModal'))?.hide();
+}
+
+function clearServiceFolderMeta() {
+    document.getElementById('serviceFolderOwnerHidden').value = '';
+    document.getElementById('serviceFolderGroupHidden').value = '';
+    renderServiceFolderMetaBadge();
+}
+
+function renderServiceFolderMetaBadge() {
+    const el = document.getElementById('serviceFolderMetaBadges');
+    if (!el) return;
+    el.innerHTML = '';
+    const owner = document.getElementById('serviceFolderOwnerHidden')?.value || '';
+    const group = document.getElementById('serviceFolderGroupHidden')?.value || '';
+    if (!owner && !group) return;
+    const span = document.createElement('span');
+    span.className = 'badge text-bg-secondary';
+    span.textContent = `${owner}:${group}`;
+    const x = document.createElement('button');
+    x.type = 'button';
+    x.className = 'btn btn-sm btn-link text-light text-decoration-none ms-2 p-0';
+    x.textContent = '×';
+    x.onclick = () => clearServiceFolderMeta();
+    span.appendChild(x);
+    el.appendChild(span);
+}
+
 function detectFileType(input) {
     const path = input.value.trim();
     const entry = input.closest('.file-entry');
     const select = entry.querySelector('.file-type-select');
-    const modeInput = entry.querySelector('.file-mode-input');
     
     // Auto-detect folder if path ends with '/'
     if (path.endsWith('/')) {
         select.value = 'folder';
     }
-    
-    // Auto-set mode to 0700 for shell scripts
-    if (path.endsWith('.sh') || path.endsWith('.bash')) {
-        modeInput.value = '0700';
-        modeInput.classList.add('border-success');
-        setTimeout(() => modeInput.classList.remove('border-success'), 1000);
-    }
+}
+
+function getServiceFolderDefaults() {
+    const svcOwner = (document.querySelector('input[name="service_owner"]')?.value || 'root').trim() || 'root';
+    const svcGroup = (document.querySelector('input[name="service_group"]')?.value || 'root').trim() || 'root';
+    const folderOwner = (document.getElementById('serviceFolderOwnerHidden')?.value || '').trim();
+    const folderGroup = (document.getElementById('serviceFolderGroupHidden')?.value || '').trim();
+    return {
+        owner: folderOwner || svcOwner,
+        group: folderGroup || svcGroup,
+    };
 }
 
 function addFileEntry() {
@@ -170,23 +334,95 @@ function addFileEntry() {
                 </select>
             </div>
         </div>
-        <div class="row mb-2">
-            <div class="col-md-4">
-                <label class="form-label small">Owner</label>
-                <input type="text" class="form-control form-control-sm file-owner-input" placeholder="root" value="root">
-            </div>
-            <div class="col-md-4">
-                <label class="form-label small">Group</label>
-                <input type="text" class="form-control form-control-sm file-group-input" placeholder="root" value="root">
-            </div>
-            <div class="col-md-4">
-                <label class="form-label small">Mode</label>
-                <input type="text" class="form-control form-control-sm file-mode-input" placeholder="0600" value="0600">
-            </div>
+        <div class="d-flex align-items-center gap-2 mb-2">
+            <button type="button" class="btn btn-sm btn-outline-secondary file-customize-btn" onclick="openFileMetaModal(this)">
+                Customize
+            </button>
+            <div class="file-meta-badges"></div>
+            <input type="hidden" class="file-owner-hidden" value="">
+            <input type="hidden" class="file-group-hidden" value="">
+            <input type="hidden" class="file-mode-hidden" value="">
         </div>
         <button type="button" class="btn btn-sm btn-danger remove-file" onclick="removeFile(this)">Remove</button>
     `;
     filesList.appendChild(newEntry);
+}
+
+function openFileMetaModal(btn) {
+    __activeFileEntryForMeta = btn.closest('.file-entry');
+    const owner = __activeFileEntryForMeta.querySelector('.file-owner-hidden')?.value || '';
+    const group = __activeFileEntryForMeta.querySelector('.file-group-hidden')?.value || '';
+    const mode = __activeFileEntryForMeta.querySelector('.file-mode-hidden')?.value || '';
+    const input = document.getElementById('fileMetaInput');
+    const err = document.getElementById('fileMetaError');
+    err.style.display = 'none';
+    input.value = (owner && group && mode) ? `${owner}:${group}:${mode}` : '';
+    const modal = new bootstrap.Modal(document.getElementById('fileMetaModal'));
+    modal.show();
+}
+
+function applyFileMetaFromModal() {
+    if (!__activeFileEntryForMeta) return;
+    const raw = (document.getElementById('fileMetaInput').value || '').trim();
+    const err = document.getElementById('fileMetaError');
+    err.style.display = 'none';
+    const parts = raw.split(':');
+    if (parts.length !== 3) {
+        err.textContent = 'Invalid format. Expected: user:group:0700';
+        err.style.display = 'block';
+        return;
+    }
+    const user = parts[0].trim();
+    const group = parts[1].trim();
+    let mode = parts[2].trim();
+    if (!user || /\s/.test(user)) {
+        err.textContent = 'Invalid user (no whitespace).';
+        err.style.display = 'block';
+        return;
+    }
+    if (!group || /\s/.test(group)) {
+        err.textContent = 'Invalid group (no whitespace).';
+        err.style.display = 'block';
+        return;
+    }
+    if (!/^[0-7]{3,4}$/.test(mode)) {
+        err.textContent = 'Invalid mode. Must be octal like 0700 or 700.';
+        err.style.display = 'block';
+        return;
+    }
+    if (mode.length === 3) mode = '0' + mode;
+    __activeFileEntryForMeta.querySelector('.file-owner-hidden').value = user;
+    __activeFileEntryForMeta.querySelector('.file-group-hidden').value = group;
+    __activeFileEntryForMeta.querySelector('.file-mode-hidden').value = mode;
+    renderFileMetaBadge(__activeFileEntryForMeta);
+    bootstrap.Modal.getInstance(document.getElementById('fileMetaModal'))?.hide();
+}
+
+function clearFileMeta(entry) {
+    entry.querySelector('.file-owner-hidden').value = '';
+    entry.querySelector('.file-group-hidden').value = '';
+    entry.querySelector('.file-mode-hidden').value = '';
+    renderFileMetaBadge(entry);
+}
+
+function renderFileMetaBadge(entry) {
+    const badges = entry.querySelector('.file-meta-badges');
+    if (!badges) return;
+    badges.innerHTML = '';
+    const owner = entry.querySelector('.file-owner-hidden')?.value || '';
+    const group = entry.querySelector('.file-group-hidden')?.value || '';
+    const mode = entry.querySelector('.file-mode-hidden')?.value || '';
+    if (!owner && !group && !mode) return;
+    const span = document.createElement('span');
+    span.className = 'badge text-bg-secondary';
+    span.textContent = `${owner}:${group}:${mode}`;
+    const x = document.createElement('button');
+    x.type = 'button';
+    x.className = 'btn btn-sm btn-link text-light text-decoration-none ms-2 p-0';
+    x.textContent = '×';
+    x.onclick = () => clearFileMeta(entry);
+    span.appendChild(x);
+    badges.appendChild(span);
 }
 
 function removeFile(button) {
@@ -251,56 +487,165 @@ function validateAndCollectFiles() {
     // Get profile
     const profile = document.querySelector('select[name="profile"]').value.toLowerCase();
     
-    // Only validate run.sh for supervisor/systemd profiles
-    if (profile !== 'supervisor' && profile !== 'systemd') {
-        return true;
-    }
-    
-    let runShFound = false;
-    let runShMode = null;
-    
-    // Check for run.sh and its mode
-    entries.forEach(entry => {
-        const path = entry.querySelector('.file-path-input').value.trim();
-        const mode = entry.querySelector('.file-mode-input').value.trim();
-        
-        if (path === 'run.sh') {
-            runShFound = true;
-            runShMode = mode;
-        }
-    });
-    
-    // Validate run.sh exists
-    if (!runShFound) {
-        alertDiv.innerHTML = '<strong>Validation Error:</strong> run.sh is required for ' + profile.charAt(0).toUpperCase() + profile.slice(1) + ' profile. Please add run.sh to the files list.';
-        alertDiv.style.display = 'block';
-        window.scrollTo(0, 0); // Scroll to top to show error
-        return false;
-    }
-    
-    // Validate run.sh permissions
-    if (runShMode) {
-        const modeStr = runShMode.replace(/^0+/, ''); // Remove leading zeros
-        const modeNum = parseInt(modeStr, 8); // Parse as octal
-        
-        if (isNaN(modeNum)) {
-            alertDiv.innerHTML = '<strong>Validation Error:</strong> Invalid mode for run.sh: ' + runShMode + '. Mode must be an octal number (e.g., 0755).';
+    // Supervisor profile is deprecated; keep validation for legacy manifests.
+    if (profile === 'supervisor') {
+        let runShFound = false;
+        entries.forEach(entry => {
+            const path = entry.querySelector('.file-path-input').value.trim();
+            if (path === 'run.sh') {
+                runShFound = true;
+            }
+        });
+        if (!runShFound) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> run.sh is required for supervisor profile.';
             alertDiv.style.display = 'block';
             window.scrollTo(0, 0);
             return false;
         }
-        
-        // Check if owner execute bit is set (bit 6 = 0o100)
-        if ((modeNum & 0o100) === 0) {
-            alertDiv.innerHTML = '<strong>Validation Error:</strong> run.sh must be executable. Current mode: ' + runShMode + '. Owner must have execute permission. Suggested: 0700, 0750, or 0755.';
+    }
+
+    // Systemd: require app.service (text)
+    if (profile === 'systemd') {
+        // Also require run.sh (mode is defaulted by the agent unless customized)
+        let runShFound = false;
+        let runShIsText = false;
+        entries.forEach(entry => {
+            const path = entry.querySelector('.file-path-input').value.trim();
+            const type = entry.querySelector('.file-type-select').value;
+            if (path === 'run.sh') {
+                runShFound = true;
+                runShIsText = (type === 'text');
+            }
+        });
+        if (!runShFound) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> run.sh is required for systemd profile.';
             alertDiv.style.display = 'block';
             window.scrollTo(0, 0);
             return false;
         }
-        
-        // Check if mode is at least 0700
-        if (modeNum < 0o700) {
-            alertDiv.innerHTML = '<strong>Validation Error:</strong> run.sh must have at least 0700 permission. Current mode: ' + runShMode + '. Suggested: 0700, 0750, or 0755.';
+        if (!runShIsText) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> run.sh must be a text file.';
+            alertDiv.style.display = 'block';
+            window.scrollTo(0, 0);
+            return false;
+        }
+
+        // Also require logs/ folder
+        let logsFound = false;
+        let logsIsFolder = false;
+        entries.forEach(entry => {
+            const path = entry.querySelector('.file-path-input').value.trim();
+            const type = entry.querySelector('.file-type-select').value;
+            if (path === 'logs/') {
+                logsFound = true;
+                logsIsFolder = (type === 'folder');
+            }
+        });
+        if (!logsFound) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> logs/ folder is required for systemd profile.';
+            alertDiv.style.display = 'block';
+            window.scrollTo(0, 0);
+            return false;
+        }
+        if (!logsIsFolder) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> logs/ must be a folder entry.';
+            alertDiv.style.display = 'block';
+            window.scrollTo(0, 0);
+            return false;
+        }
+
+        let found = false;
+        let isText = false;
+        entries.forEach(entry => {
+            const path = entry.querySelector('.file-path-input').value.trim();
+            const type = entry.querySelector('.file-type-select').value;
+            if (path === 'app.service') {
+                found = true;
+                isText = (type === 'text');
+            }
+        });
+        if (!found) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> app.service is required for systemd profile.';
+            alertDiv.style.display = 'block';
+            window.scrollTo(0, 0);
+            return false;
+        }
+        if (!isText) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> app.service must be a text file.';
+            alertDiv.style.display = 'block';
+            window.scrollTo(0, 0);
+            return false;
+        }
+    }
+
+    // ProcessMaster: require service.yml (text)
+    if (profile === 'processmaster') {
+        // Also require run.sh (mode is defaulted by the agent unless customized)
+        let runShFound = false;
+        let runShIsText = false;
+        entries.forEach(entry => {
+            const path = entry.querySelector('.file-path-input').value.trim();
+            const type = entry.querySelector('.file-type-select').value;
+            if (path === 'run.sh') {
+                runShFound = true;
+                runShIsText = (type === 'text');
+            }
+        });
+        if (!runShFound) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> run.sh is required for processmaster profile.';
+            alertDiv.style.display = 'block';
+            window.scrollTo(0, 0);
+            return false;
+        }
+        if (!runShIsText) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> run.sh must be a text file.';
+            alertDiv.style.display = 'block';
+            window.scrollTo(0, 0);
+            return false;
+        }
+
+        // Also require logs/ folder
+        let logsFound = false;
+        let logsIsFolder = false;
+        entries.forEach(entry => {
+            const path = entry.querySelector('.file-path-input').value.trim();
+            const type = entry.querySelector('.file-type-select').value;
+            if (path === 'logs/') {
+                logsFound = true;
+                logsIsFolder = (type === 'folder');
+            }
+        });
+        if (!logsFound) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> logs/ folder is required for processmaster profile.';
+            alertDiv.style.display = 'block';
+            window.scrollTo(0, 0);
+            return false;
+        }
+        if (!logsIsFolder) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> logs/ must be a folder entry.';
+            alertDiv.style.display = 'block';
+            window.scrollTo(0, 0);
+            return false;
+        }
+
+        let found = false;
+        let isText = false;
+        entries.forEach(entry => {
+            const path = entry.querySelector('.file-path-input').value.trim();
+            const type = entry.querySelector('.file-type-select').value;
+            if (path === 'service.yml') {
+                found = true;
+                isText = (type === 'text');
+            }
+        });
+        if (!found) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> service.yml is required for processmaster profile.';
+            alertDiv.style.display = 'block';
+            window.scrollTo(0, 0);
+            return false;
+        }
+        if (!isText) {
+            alertDiv.innerHTML = '<strong>Validation Error:</strong> service.yml must be a text file.';
             alertDiv.style.display = 'block';
             window.scrollTo(0, 0);
             return false;
@@ -323,9 +668,9 @@ function collectFiles() {
     entries.forEach(entry => {
         const path = entry.querySelector('.file-path-input').value.trim();
         const type = entry.querySelector('.file-type-select').value;
-        const owner = entry.querySelector('.file-owner-input').value.trim() || 'root';
-        const group = entry.querySelector('.file-group-input').value.trim() || 'root';
-        const mode = entry.querySelector('.file-mode-input').value.trim() || '0600';
+        const owner = entry.querySelector('.file-owner-hidden')?.value.trim() || '';
+        const group = entry.querySelector('.file-group-hidden')?.value.trim() || '';
+        const mode = entry.querySelector('.file-mode-hidden')?.value.trim() || '';
         
         if (path) {
             paths.push(path);
@@ -343,11 +688,31 @@ function collectFiles() {
     document.getElementById('modesInput').value = modes.join('\n');
 }
 
+function handleProfileChange() {
+    const profile = document.getElementById('profileSelect').value;
+    const rpContainer = document.getElementById('resourceProfileContainer');
+    const rpSelect = document.getElementById('resourceProfileSelect');
+
+    if (profile === 'systemd' || profile === 'processmaster') {
+        rpContainer.style.display = 'block';
+        rpSelect.required = true;
+    } else {
+        rpContainer.style.display = 'none';
+        rpSelect.required = false;
+    }
+}
+
 function toggleLogFields() {
     const checkbox = document.getElementById('collectLogs');
     const container = document.getElementById('logFieldsContainer');
     container.style.display = checkbox.checked ? 'block' : 'none';
 }
+
+document.addEventListener('DOMContentLoaded', function() {
+    handleProfileChange();
+    renderServiceFolderMetaBadge();
+    document.querySelectorAll('.file-entry').forEach(e => renderFileMetaBadge(e));
+});
 </script>
 {% endblock %}
 

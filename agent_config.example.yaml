@@ -6,6 +6,7 @@ global:
   log_rotation: "daily"                # daily, hourly, or never
   s3_retry_count: 3                    # Number of retry attempts for S3 operations (default: 3)
   s3_retry_delay_ms: 1000              # Delay between retries in milliseconds (default: 1000)
+  rollback_on_failure: true            # Optional: rollback to previous version on deploy failure (default: true)
 
 object_storage:
   endpoint: "https://oss-cn-hangzhou.aliyuncs.com"
@@ -15,19 +16,17 @@ object_storage:
   path_style: false                    # Use virtual-hosted-style (true for path-style)
   prefix: "prod"                       # Required: prefix for all S3 keys (alphanumerics, hyphens, underscores only)
 
-# Supervisor configuration (optional, if using supervisor profile)
-supervisor:
-  conf_d_folder: "/etc/supervisor/conf.d"
-  service_folder: "/opt/services"
-  template_path: "/etc/fileguard/supervisor.conf.template"
-  supervisorctl_path: "/usr/bin/supervisorctl"  # Optional, defaults to /usr/bin/supervisorctl
-
 # Systemd configuration (optional, if using systemd profile)
 systemd:
   service_folder: "/etc/systemd/system"
   working_directory: "/opt/services"
-  template_path: "/etc/fileguard/systemd.service.template"
   systemctl_path: "/usr/bin/systemctl"  # Optional, defaults to /usr/bin/systemctl
+
+# ProcessMaster configuration (optional, if using processmaster profile)
+processmaster:
+  pmctl_path: "/usr/bin/pmctl"
+  sock: "/tmp/processmaster.sock"      # Optional; if omitted, pmctl uses PMCTL_SOCK or its default
+  auto_services_root: "/opt/auto_services"
 
 # Deploy profile configuration (optional, if using deploy profile for simple file deployment)
 deploy:

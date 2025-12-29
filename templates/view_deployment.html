@@ -89,6 +89,7 @@
     const versionName = '{{ version }}';
     
     let currentFileStatuses = [];
+    let serviceTemplateInfo = null;
     
     // Helper function to format bytes
     function formatBytes(bytes) {
@@ -191,6 +192,13 @@
                             html += `<button class="btn btn-sm btn-info" onclick="showStagingModal('${file.path}')">
                                         <i class="bi bi-folder-symlink"></i> Copy from Staging
                                      </button>`;
+
+                            // Generate templates (run.sh + service files)
+                            if (file.file_type === 'text' && (file.path === 'run.sh' || (serviceTemplateInfo && file.path === serviceTemplateInfo.target_path))) {
+                                html += `<button class="btn btn-sm btn-warning ms-1" onclick="generateFile('${file.path}')">
+                                            <i class="bi bi-magic"></i> Generate
+                                         </button>`;
+                            }
                         }
                         {% else %}
                         if (file.exists) {
@@ -225,7 +233,49 @@
                     '<div class="alert alert-danger">Failed to load files status</div>';
             });
     }
-    
+
+    function loadServiceTemplateInfo() {
+        fetch(`/api/service-template?manifest=${encodeURIComponent(manifestName)}`)
+            .then(r => r.json())
+            .then(data => {
+                if (data && data.ok) {
+                    serviceTemplateInfo = data;
+                } else {
+                    serviceTemplateInfo = null;
+                }
+            })
+            .catch(_ => { serviceTemplateInfo = null; });
+    }
+
+    function generateFile(filePath) {
+        if (!serviceTemplateInfo || !serviceTemplateInfo.ok) {
+            // run.sh does not need serviceTemplateInfo
+            if (filePath !== 'run.sh') {
+                alert('Service template is not available for this manifest.');
+                return;
+            }
+        }
+        fetch('/deployments/generate-service-file', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                manifest: manifestName,
+                version: versionName,
+                file_path: filePath,
+                values: {},
+            }),
+        })
+        .then(r => r.json())
+        .then(resp => {
+            if (!resp.ok) {
+                alert(`Generate failed: ${resp.error || 'unknown error'}`);
+            } else {
+                loadManifestFiles();
+            }
+        })
+        .catch(e => alert(`Generate failed: ${e}`));
+    }
+
     function showUploadModal(filePath) {
         document.getElementById('uploadFilePath').value = filePath;
         document.getElementById('uploadFileLabel').textContent = `Upload: ${filePath}`;
@@ -446,8 +496,9 @@
             statusDiv.innerHTML = '<i class="bi bi-exclamation-triangle"></i> No files defined in manifest.';
             finishButton.disabled = true;
         } else if (missingFiles.length === 0) {
+            // All files uploaded. Seal will perform unresolved-placeholder checks server-side.
             statusDiv.className = 'alert alert-success mb-3';
-            statusDiv.innerHTML = `<i class="bi bi-check-circle"></i> All required files uploaded (${requiredFiles.length}/${requiredFiles.length}). Ready to finish!`;
+            statusDiv.innerHTML = `<i class="bi bi-check-circle"></i> All required files uploaded (${requiredFiles.length}/${requiredFiles.length}). Ready to seal!`;
             finishButton.disabled = false;
         } else {
             statusDiv.className = 'alert alert-warning mb-3';
@@ -459,6 +510,7 @@
     
     // finishDeployment removed - now handled by form submission
     
+    loadServiceTemplateInfo();
     loadManifestFiles();
     setInterval(loadManifestFiles, 5000); // Refresh every 5 seconds
 </script>

@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+
+{% block title %}Resource Profiles{% endblock %}
+{% block nav_resource_profiles %}active{% endblock %}
+
+{% block content %}
+<h2>Resource Profiles</h2>
+<p class="text-muted">
+  Resource profiles define reusable limits for CPU/RAM/SWAP and IO weight. The built-in <code>unlimited</code>
+  profile is always available and cannot be edited.
+</p>
+
+<table class="table table-striped">
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>CPU</th>
+      <th>Memory</th>
+      <th>Memory Swap</th>
+      <th>IO weight</th>
+      <th>Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for p in profiles %}
+    <tr>
+      <td><code>{{ p.name }}</code></td>
+      <td>{{ p.cpu_display }}</td>
+      <td>{{ p.memory_display }}</td>
+      <td>{{ p.memory_swap_display }}</td>
+      <td>{{ p.io_weight_display }}</td>
+      <td>
+        {% if p.editable %}
+          <a class="btn btn-sm btn-primary" href="/resource-profiles/edit?name={{ p.name }}">Edit</a>
+          <form method="post" action="/resource-profiles/delete" style="display:inline">
+            <input type="hidden" name="name" value="{{ p.name }}" />
+            <button class="btn btn-sm btn-danger" type="submit" onclick="return confirm('Delete profile {{ p.name }}?')">Delete</button>
+          </form>
+        {% else %}
+          <span class="text-muted">Built-in</span>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<hr />
+
+<h3>Add Resource Profile</h3>
+<form method="post" action="/resource-profiles/add">
+  {% match error %}
+  {% when Some with (msg) %}
+  <div class="alert alert-danger" id="addProfileError">{{ msg }}</div>
+  {% when None %}
+  <div class="alert alert-danger d-none" id="addProfileError"></div>
+  {% endmatch %}
+
+  <div class="mb-3">
+    <label class="form-label">Name</label>
+    <input class="form-control" name="name" placeholder="e.g. small, medium, db" value="{{ add_form.name }}" required />
+    <div class="form-text">Allowed: alphanumerics, hyphen, underscore. Max 40 chars. <code>unlimited</code> is reserved.</div>
+  </div>
+
+  <div class="row">
+    <div class="col-md-3 mb-3">
+      <label class="form-label">CPU</label>
+      <input class="form-control" name="cpu" placeholder="e.g. 200m (min 100m)" value="{{ add_form.cpu }}" />
+    </div>
+    <div class="col-md-3 mb-3">
+      <label class="form-label">Memory</label>
+      <input class="form-control" name="memory" placeholder="e.g. 512MiB, 2G (min 5MiB)" value="{{ add_form.memory }}" />
+    </div>
+    <div class="col-md-3 mb-3">
+      <label class="form-label">Memory Swap</label>
+      <input class="form-control" name="memory_swap" placeholder="e.g. 0b, 1GiB (default 0b)" value="{{ add_form.memory_swap }}" />
+    </div>
+    <div class="col-md-3 mb-3">
+      <label class="form-label">IO weight</label>
+      <input class="form-control" name="io_weight" placeholder="1..10000 (optional)" value="{{ add_form.io_weight }}" />
+    </div>
+  </div>
+
+  <button type="submit" class="btn btn-success">Add</button>
+</form>
+
+<script>
+const CPU_RE = /^[0-9]+m$/i; // e.g. 200m
+// e.g. 512MiB, 2G, 200K, 0b
+const SIZE_RE = /^[0-9]+(?:(?:k|m|g|ki|mi|gi)(?:b)?|b)$/i;
+const INT_RE = /^[0-9]+$/;
+
+function validateAddResourceProfileForm() {
+  const cpu = document.querySelector('form[action="/resource-profiles/add"] input[name="cpu"]').value;
+  const memory = document.querySelector('form[action="/resource-profiles/add"] input[name="memory"]').value;
+  const memorySwap = document.querySelector('form[action="/resource-profiles/add"] input[name="memory_swap"]').value;
+  const ioWeight = document.querySelector('form[action="/resource-profiles/add"] input[name="io_weight"]').value;
+
+  try {
+    const cpuT = (cpu || '').trim();
+    if (cpuT && !CPU_RE.test(cpuT)) throw new Error('cpu format: NNNm (example: 200m)');
+
+    const memT = (memory || '').trim();
+    if (memT && !SIZE_RE.test(memT)) throw new Error("memory format: <number><unit> where unit is k/m/g/ki/mi/gi with optional 'B' (example: 512MiB, 2G, 0b)");
+
+    const swapT = (memorySwap || '').trim();
+    if (swapT && !SIZE_RE.test(swapT)) throw new Error("memory_swap format: <number><unit> where unit is k/m/g/ki/mi/gi with optional 'B' (example: 0b, 1GiB)");
+
+    const wT = (ioWeight || '').trim();
+    if (wT && !INT_RE.test(wT)) throw new Error('io_weight format: integer (example: 100)');
+    return true;
+  } catch (e) {
+    const box = document.getElementById('addProfileError');
+    box.textContent = (e && e.message) ? e.message : String(e);
+    box.classList.remove('d-none');
+    return false;
+  }
+}
+
+document.querySelector('form[action="/resource-profiles/add"]').addEventListener('submit', function(e) {
+  if (!validateAddResourceProfileForm()) e.preventDefault();
+});
+</script>
+{% endblock %}
+
+

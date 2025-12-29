@@ -44,15 +44,27 @@ function deleteVersion(manifest, version) {
         form.submit();
     }
 }
+
+function cleanupOrphanDeployments() {
+    window.location.href = '/deployments/cleanup';
+}
 </script>
 
 <!-- Existing Deployments Section -->
 <div class="card mb-4">
     <div class="card-header d-flex justify-content-between align-items-center">
         <h5 class="mb-0"><i class="bi bi-archive"></i> Existing Deployments</h5>
-        <a href="/deployments/create" class="btn btn-success">
-            <i class="bi bi-plus-circle"></i> Create Deployment
-        </a>
+        <div class="d-flex gap-2">
+            <a class="btn btn-outline-secondary" href="/deployments/recycle">
+                <i class="bi bi-recycle"></i> Recycle Bin
+            </a>
+            <button class="btn btn-outline-danger" onclick="cleanupOrphanDeployments()">
+                <i class="bi bi-trash3"></i> Cleanup Deployment
+            </button>
+            <a href="/deployments/create" class="btn btn-success">
+                <i class="bi bi-plus-circle"></i> Create Deployment
+            </a>
+        </div>
     </div>
     <div class="card-body">
 {% if !existing_deployments.is_empty() %}

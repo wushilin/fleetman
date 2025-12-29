@@ -10,9 +10,14 @@
 <div class="card mb-4">
     <div class="card-header d-flex justify-content-between align-items-center">
         <h5 class="mb-0">Configured Cells</h5>
-        <a href="/cells/add" class="btn btn-success">
-            <i class="bi bi-plus-circle"></i> Add Cell
-        </a>
+        <div class="d-flex gap-2">
+            <a href="/cells" class="btn btn-outline-secondary">
+                <i class="bi bi-arrow-clockwise"></i> Refresh
+            </a>
+            <a href="/cells/add" class="btn btn-success">
+                <i class="bi bi-plus-circle"></i> Add Cell
+            </a>
+        </div>
     </div>
     <div class="card-body">
         {% if cells.is_empty() %}

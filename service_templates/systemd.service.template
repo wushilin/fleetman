@@ -1,0 +1,32 @@
+[Unit]
+Description={{ fleetagent_cell_id }} (Fleetman)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={{ fleetagent_service_working_dir }}
+ExecStart={{ fleetagent_service_working_dir }}/run.sh
+Restart=always
+User={{ service_user }}
+Group={{ service_group }}
+RestartSec=2
+TimeoutStopSec=5
+
+{%- if cpu_quota.is_some() %}
+CPUQuota={{ cpu_quota.as_ref().unwrap() }}
+{%- endif %}
+{%- if memory_max.is_some() %}
+MemoryMax={{ memory_max.as_ref().unwrap() }}
+{%- endif %}
+{%- if memory_swap_max.is_some() %}
+MemorySwapMax={{ memory_swap_max.as_ref().unwrap() }}
+{%- endif %}
+{%- if io_weight.is_some() %}
+IOWeight={{ io_weight.unwrap() }}
+{%- endif %}
+
+[Install]
+WantedBy=multi-user.target
+
+

@@ -65,6 +65,10 @@ impl AgentState {
     pub fn get_cell(&self, cell_id: &str) -> Option<&CellState> {
         self.cells.get(cell_id)
     }
+
+    pub fn remove_cell(&mut self, cell_id: &str) {
+        self.cells.remove(cell_id);
+    }
 }
 
 pub type SharedState = Arc<Mutex<AgentState>>;

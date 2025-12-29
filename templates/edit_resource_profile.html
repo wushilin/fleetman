@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+
+{% block title %}Edit Resource Profile{% endblock %}
+{% block nav_resource_profiles %}active{% endblock %}
+
+{% block content %}
+<h2>Edit Resource Profile</h2>
+
+<p><b>Name:</b> <code>{{ name }}</code></p>
+
+<form method="post" action="/resource-profiles/update">
+  <input type="hidden" name="name" value="{{ name }}" />
+
+  <div class="row">
+    <div class="col-md-3 mb-3">
+      <label class="form-label">CPU</label>
+      <input class="form-control" name="cpu" value="{{ cpu }}" placeholder="e.g. 200m (min 100m)" />
+    </div>
+    <div class="col-md-3 mb-3">
+      <label class="form-label">Memory</label>
+      <input class="form-control" name="memory" value="{{ memory }}" placeholder="e.g. 512MiB, 2G (min 5MiB)" />
+    </div>
+    <div class="col-md-3 mb-3">
+      <label class="form-label">Memory Swap</label>
+      <input class="form-control" name="memory_swap" value="{{ memory_swap }}" placeholder="e.g. 0b, 1GiB (default 0b)" />
+    </div>
+    <div class="col-md-3 mb-3">
+      <label class="form-label">IO weight</label>
+      <input class="form-control" name="io_weight" value="{{ io_weight }}" placeholder="1..10000 (optional)" />
+    </div>
+  </div>
+
+  {% match error %}
+  {% when Some with (msg) %}
+  <div class="alert alert-danger" id="editProfileError"><b>Validation failed:</b> {{ msg }}</div>
+  {% when None %}
+  <div class="alert alert-danger d-none" id="editProfileError"></div>
+  {% endmatch %}
+
+  <button type="submit" class="btn btn-primary">Save</button>
+  <a class="btn btn-secondary" href="/resource-profiles">Cancel</a>
+</form>
+
+<script>
+const CPU_RE = /^[0-9]+m$/i; // e.g. 200m
+// e.g. 512MiB, 2G, 200K, 0b
+const SIZE_RE = /^[0-9]+(?:(?:k|m|g|ki|mi|gi)(?:b)?|b)$/i;
+const INT_RE = /^[0-9]+$/;
+
+function validateResourceProfileForm() {
+  // If the backend already returned an error, keep the UX consistent and show inline too.
+  // Pre-flight validation (blocks submit with a clear message).
+  const cpu = document.querySelector('input[name="cpu"]').value;
+  const memory = document.querySelector('input[name="memory"]').value;
+  const memorySwap = document.querySelector('input[name="memory_swap"]').value;
+  const ioWeight = document.querySelector('input[name="io_weight"]').value;
+
+  try {
+    const cpuT = (cpu || '').trim();
+    if (cpuT && !CPU_RE.test(cpuT)) throw new Error('cpu format: NNNm (example: 200m)');
+
+    const memT = (memory || '').trim();
+    if (memT && !SIZE_RE.test(memT)) throw new Error("memory format: <number><unit> where unit is k/m/g/ki/mi/gi with optional 'B' (example: 512MiB, 2G, 0b)");
+
+    const swapT = (memorySwap || '').trim();
+    if (swapT && !SIZE_RE.test(swapT)) throw new Error("memory_swap format: <number><unit> where unit is k/m/g/ki/mi/gi with optional 'B' (example: 0b, 1GiB)");
+
+    const wT = (ioWeight || '').trim();
+    if (wT && !INT_RE.test(wT)) throw new Error('io_weight format: integer (example: 100)');
+    return true;
+  } catch (e) {
+    const box = document.getElementById('editProfileError');
+    box.textContent = (e && e.message) ? e.message : String(e);
+    box.classList.remove('d-none');
+    return false;
+  }
+}
+
+document.querySelector('form[action="/resource-profiles/update"]').addEventListener('submit', function(e) {
+  if (!validateResourceProfileForm()) e.preventDefault();
+});
+</script>
+{% endblock %}
+
+

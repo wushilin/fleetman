@@ -37,6 +37,11 @@
                         </a>
                     </li>
                     <li class="nav-item">
+                        <a class="nav-link {% block nav_resource_profiles %}{% endblock %}" href="/resource-profiles">
+                            <i class="bi bi-sliders"></i> Resource Profiles
+                        </a>
+                    </li>
+                    <li class="nav-item">
                         <a class="nav-link {% block nav_manifests %}{% endblock %}" href="/manifests">
                             <i class="bi bi-file-earmark-text"></i> Manifests
                         </a>
@@ -48,12 +53,12 @@
                     </li>
                     <li class="nav-item">
                         <a class="nav-link {% block nav_cells %}{% endblock %}" href="/cells">
-                            <i class="bi bi-grid-3x3"></i> Cells
+                            <i class="bi bi-grid-3x3"></i> Deployment Cells
                         </a>
                     </li>
                     <li class="nav-item">
                         <a class="nav-link {% block nav_agents %}{% endblock %}" href="/agents">
-                            <i class="bi bi-hdd-network"></i> Agents
+                            <i class="bi bi-hdd-network"></i> Fleet Agents
                         </a>
                     </li>
                 </ul>

@@ -110,6 +110,12 @@ manifests:
       group: root
       mode: '0600'
     profile: systemd
+    resource_profile: unlimited
+    service_owner: root
+    service_group: root
+    service_folder_owner: root
+    service_folder_group: root
+    service_folder_mode: "0700"
     bucket: fleetman-oss-sg-prod
     collect_logs: false
     log_files: []
@@ -227,4 +233,12 @@ cells:
     manifest: fafafaf
 s3_retry_count: 3
 s3_retry_delay_ms: 1000
+
+# Resource profiles (optional). Built-in profile "unlimited" always exists and is not editable in UI.
+resource_profiles:
+  small:
+    cpu: "500m"
+    memory: "512MiB"
+    memory_swap: "0"
+    io_weight: 100
 

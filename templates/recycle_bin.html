@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+
+{% block title %}Recycle Bin - Fleetman{% endblock %}
+{% block nav_deployments %}active{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h1 class="mb-0">Recycle Bin</h1>
+  <div class="d-flex gap-2">
+    <a class="btn btn-outline-secondary" href="/deployments"><i class="bi bi-arrow-left"></i> Back</a>
+    <a class="btn btn-outline-danger" href="/deployments/recycle/clear"><i class="bi bi-trash3"></i> Clear Deleted Deployments</a>
+  </div>
+</div>
+
+{% if entries.is_empty() %}
+  <p class="text-muted">Recycle bin is empty.</p>
+{% else %}
+  <div class="alert alert-info">
+    Found <strong>{{ entries.len() }}</strong> deleted deployment(s), total <strong>{{ total_objects }}</strong> object(s).
+  </div>
+
+  <div class="table-responsive">
+    <table class="table table-sm table-striped">
+      <thead>
+        <tr>
+          <th>Bucket</th>
+          <th>Manifest</th>
+          <th>Version</th>
+          <th>Deleted At</th>
+          <th>Objects</th>
+          <th>Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for e in entries %}
+        <tr>
+          <td><code>{{ e.bucket_display }}</code></td>
+          <td><code>{{ e.manifest_name }}</code></td>
+          <td><code>{{ e.version }}</code></td>
+          <td><code>{{ e.deleted_at_display }}</code></td>
+          <td><code>{{ e.object_count }}</code></td>
+          <td class="d-flex gap-2">
+            <form method="POST" action="/deployments/recycle/restore" onsubmit="return confirm('Restore {{ e.manifest_name }} {{ e.version }}?');">
+              <input type="hidden" name="bucket" value="{{ e.bucket_display }}">
+              <input type="hidden" name="recycle_prefix" value="{{ e.recycle_prefix_base }}">
+              <button class="btn btn-sm btn-success"><i class="bi bi-arrow-counterclockwise"></i> Restore</button>
+            </form>
+            <form method="POST" action="/deployments/recycle/delete" onsubmit="return confirm('Delete permanently? This cannot be undone.');">
+              <input type="hidden" name="bucket" value="{{ e.bucket_display }}">
+              <input type="hidden" name="recycle_prefix" value="{{ e.recycle_prefix_base }}">
+              <button class="btn btn-sm btn-danger"><i class="bi bi-x-circle"></i> Delete Permanently</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% endif %}
+{% endblock %}
+
+

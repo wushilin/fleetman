@@ -1,0 +1,41 @@
+application: fleetman-{{ fleetagent_cell_id }}
+global:
+  enabled: true
+process:
+  start_command:
+  - ./run.sh
+  stop_signal: SIGTERM
+  # stop_command: ["./stop.sh"]
+  stop_grace_period_ms: 5000
+  working_directory: {{ fleetagent_service_working_dir }}
+  environment: []
+  user: {{ service_user }}
+  group: {{ service_group }}
+
+
+{%- if cpu.is_some() || memory.is_some() || memory_swap.is_some() || io_weight.is_some() %}
+resources:
+{%- if cpu.is_some() %}
+  max_cpu: {{ cpu.as_ref().unwrap() }}
+{%- endif %}
+{%- if memory.is_some() %}
+  max_memory: {{ memory.as_ref().unwrap() }}
+{%- endif %}
+{%- if memory_swap.is_some() %}
+  max_swap: {{ memory_swap.as_ref().unwrap() }}
+{%- endif %}
+{%- if io_weight.is_some() %}
+  io_weight: {{ io_weight.unwrap() }}
+{%- endif %}
+{%- endif %}
+
+# provision:
+# - path: .
+#   ownership:
+#     user: {{ service_user }}
+#     group: {{ service_group }}
+#     recursive: true
+#   mode: 0700
+# - path: ./run.sh
+#   mode: 0700
+#   add_net_bind_capability: true

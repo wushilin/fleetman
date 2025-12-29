@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+
+{% block title %}Clear Deleted Deployments - Fleetman{% endblock %}
+{% block nav_deployments %}active{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h1 class="mb-0">Clear Deleted Deployments</h1>
+  <a class="btn btn-outline-secondary" href="/deployments/recycle"><i class="bi bi-arrow-left"></i> Back</a>
+</div>
+
+{% if entries.is_empty() %}
+  <p class="text-muted">Recycle bin is empty.</p>
+{% else %}
+  <div class="alert alert-warning">
+    This will permanently delete everything in the recycle bin.
+  </div>
+
+  <div class="alert alert-info">
+    Found <strong>{{ entries.len() }}</strong> deleted deployment(s), total <strong>{{ total_objects }}</strong> object(s).
+  </div>
+
+  <div class="table-responsive mb-3">
+    <table class="table table-sm table-striped">
+      <thead>
+        <tr>
+          <th>Bucket</th>
+          <th>Manifest</th>
+          <th>Version</th>
+          <th>Deleted At</th>
+          <th>Objects</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for e in entries %}
+        <tr>
+          <td><code>{{ e.bucket_display }}</code></td>
+          <td><code>{{ e.manifest_name }}</code></td>
+          <td><code>{{ e.version }}</code></td>
+          <td><code>{{ e.deleted_at_display }}</code></td>
+          <td><code>{{ e.object_count }}</code></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <form method="POST" action="/deployments/recycle/clear" onsubmit="return confirm('Permanently delete all recycle bin entries? This cannot be undone.');">
+    <button class="btn btn-danger"><i class="bi bi-trash3"></i> Yes, clear now</button>
+  </form>
+{% endif %}
+
+{% endblock %}
+
+
