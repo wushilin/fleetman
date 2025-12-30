@@ -144,7 +144,7 @@
                 updateDeploymentStatus();
                 
                 let html = '<div class="table-responsive"><table class="table table-hover">';
-                html += '<thead><tr><th>File</th><th>Type</th><th>Size</th><th>Last Modified</th><th>Status</th><th>Actions</th></tr></thead><tbody>';
+                html += '<thead><tr><th>File</th><th>Type</th><th>Attrs</th><th>Size</th><th>Last Modified</th><th>Status</th><th>Actions</th></tr></thead><tbody>';
                 
                 data.files.forEach(file => {
                     html += '<tr>';
@@ -153,6 +153,13 @@
                     // File type badge with different color for folders
                     const typeColor = file.file_type === 'text' ? 'info' : (file.file_type === 'folder' ? 'warning' : 'secondary');
                     html += `<td><span class="badge bg-${typeColor}">${file.file_type}</span></td>`;
+
+                    // Attrs (user:group:mode), with inherited vs explicit styling
+                    const attrs = file.attrs || '-:-:-';
+                    const explicit = !!file.attrs_explicit;
+                    const attrsClass = explicit ? 'badge bg-warning-subtle text-dark border border-warning-subtle' : 'badge bg-light text-muted border';
+                    const attrsTip = explicit ? 'Explicitly set' : 'Inherited';
+                    html += `<td><span class="${attrsClass}" data-bs-toggle="tooltip" data-bs-placement="top" title="${attrsTip}">${attrs}</span></td>`;
                     
                     // Size and Last Modified
                     html += `<td>${formatBytes(file.size)}</td>`;
@@ -227,6 +234,13 @@
                 
                 html += '</tbody></table></div>';
                 document.getElementById('manifestFilesList').innerHTML = html;
+
+                // Activate tooltips (re-init after each refresh)
+                const tooltipEls = document.querySelectorAll('#manifestFilesList [data-bs-toggle="tooltip"]');
+                tooltipEls.forEach(el => {
+                    try { bootstrap.Tooltip.getInstance(el)?.dispose(); } catch (_) {}
+                    new bootstrap.Tooltip(el);
+                });
             })
             .catch(error => {
                 document.getElementById('manifestFilesList').innerHTML = 

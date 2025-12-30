@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+
+{% block title %}Cell Version: {{ node_id }}/{{ cell_id }} {{ version }} - Fleetman{% endblock %}
+{% block nav_cells %}active{% endblock %}
+
+{% block content %}
+<div class="mb-3">
+    <a href="/cells/{{ node_id }}/{{ cell_id }}/versions" class="btn btn-secondary">&larr; Back to Versions</a>
+</div>
+
+<h1>Cell Version: <span class="text-primary">{{ node_id }}/{{ cell_id }}</span></h1>
+<p class="text-muted mb-3">
+    Bucket: <strong>{{ bucket }}</strong><br>
+    Version: <code>{{ version }}</code>
+</p>
+
+{% if error.is_some() %}
+<div class="alert alert-danger">
+    <i class="bi bi-exclamation-triangle"></i> {{ error.as_ref().unwrap() }}
+</div>
+{% endif %}
+
+<div class="card">
+    <div class="card-header">
+        <h5 class="mb-0">Merged View (effective user:group:mode)</h5>
+    </div>
+    <div class="card-body">
+        {% if files.is_empty() %}
+        <div class="text-muted">No files found in this version.</div>
+        {% else %}
+        <div class="table-responsive">
+            <table class="table table-hover table-sm align-middle">
+                <thead>
+                    <tr>
+                        <th style="width: 40%">Path</th>
+                        <th style="width: 10%">Type</th>
+                        <th style="width: 20%">Attrs</th>
+                        <th style="width: 10%">ETag</th>
+                        <th style="width: 10%" class="text-end">Size</th>
+                        <th style="width: 10%">Modified</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for f in files %}
+                    <tr>
+                        <td><code>{{ f.path }}</code></td>
+                        <td><span class="badge bg-secondary">{{ f.file_type }}</span></td>
+                        <td><span class="badge text-bg-light border"><code>{{ f.attrs }}</code></span></td>
+                        <td class="text-muted"><code>{{ f.etag }}</code></td>
+                        <td class="text-end">
+                            {% match f.size %}
+                            {% when Some with (s) %}
+                                {{ s }} bytes
+                            {% when None %}
+                                -
+                            {% endmatch %}
+                        </td>
+                        <td><small class="text-muted">{{ f.last_modified }}</small></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
+
+

@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+
+{% block title %}Folder Deleted - Fleetman{% endblock %}
+{% block nav_buckets %}active{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <div>
+        <h1 class="mb-1">Folder Delete Result</h1>
+        <div class="text-muted">
+            <strong>{{ bucket_display }}</strong> → <code>{{ bucket_name }}</code>
+        </div>
+    </div>
+    <form method="get" action="/buckets/manage" class="d-inline">
+        <input type="hidden" name="name" value="{{ bucket_display }}">
+        <input type="hidden" name="prefix" value="{{ return_prefix }}">
+        <button class="btn btn-outline-secondary" type="submit">
+            <i class="bi bi-arrow-left"></i> Back
+        </button>
+    </form>
+</div>
+
+<div class="card">
+    <div class="card-header">
+        <i class="bi bi-check2-circle"></i> Summary
+    </div>
+    <div class="card-body">
+        <div class="mb-2">
+            Folder prefix:
+            <div><code>{{ folder_prefix }}</code></div>
+        </div>
+        <div class="mb-2">
+            Deleted objects: <strong>{{ deleted_count }}</strong>
+        </div>
+        {% if remaining_count > 0 %}
+        <div class="alert alert-warning mt-3 mb-0">
+            <i class="bi bi-exclamation-triangle"></i> Some objects remain under this prefix: <strong>{{ remaining_count }}</strong>.
+            Try again, or check credentials/policies.
+        </div>
+        {% endif %}
+    </div>
+</div>
+{% endblock %}
+
+

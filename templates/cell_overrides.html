@@ -38,17 +38,9 @@
                         <td><code>{{ file.path }}</code></td>
                         <td><span class="badge bg-secondary">{{ file.file_type }}</span></td>
                         <td>
-                            {% match file.owner_group %}
-                            {% when Some with (og) %}
-                                <span class="badge bg-info text-dark">{{ og }}</span>
-                            {% when None %}
-                            {% endmatch %}
-                            {% match file.mode %}
-                            {% when Some with (m) %}
-                                <span class="badge bg-warning text-dark">{{ m }}</span>
-                            {% when None %}
-                            {% endmatch %}
-                            {% if file.owner_group.is_none() && file.mode.is_none() %}
+                            {% if file.has_custom_meta %}
+                                <span class="badge text-bg-secondary">{{ file.meta_str }}</span>
+                            {% else %}
                                 <span class="text-muted">default</span>
                             {% endif %}
                         </td>
@@ -62,7 +54,7 @@
                             <button type="button" class="btn btn-sm btn-secondary" disabled>Edit</button>
                             {% endif %}
                             <button type="button" class="btn btn-sm btn-info"
-                                    onclick="showEditMetaModal('{{ file.path }}', '{{ file.file_type }}', '{{ file.owner_group_str }}', '{{ file.mode_str }}')">
+                                    onclick="showEditMetaModal('{{ file.path }}', '{{ file.file_type }}', '{{ file.owner_str }}', '{{ file.group_str }}', '{{ file.mode_str }}')">
                                 Customize
                             </button>
                             <form method="post" action="/cells/{{ node_id }}/{{ cell_id }}/overrides/delete" 
@@ -149,14 +141,10 @@
             <div class="mb-3">
                 <label class="form-label">Meta</label>
                 <div class="d-flex align-items-center gap-2 flex-wrap">
-                    <button type="button" class="btn btn-sm btn-outline-secondary" onclick="showAddMetaModal()">
+                    <button type="button" class="btn btn-sm btn-outline-secondary" onclick="openOverrideMetaModal('add')">
                         <i class="bi bi-sliders"></i> Customize
                     </button>
-                    <span id="addMetaBadgeOwnerGroup" class="badge bg-info text-dark" style="display:none;"></span>
-                    <span id="addMetaBadgeMode" class="badge bg-warning text-dark" style="display:none;"></span>
-                    <button type="button" id="addMetaRemoveBtn" class="btn btn-sm btn-outline-danger" style="display:none;" onclick="clearAddMeta()">
-                        <i class="bi bi-x"></i> Remove
-                    </button>
+                    <div id="addMetaBadges"></div>
                     <span id="addMetaDefaultHint" class="text-muted">default</span>
                 </div>
                 <div class="form-text">
@@ -207,42 +195,25 @@
     </div>
 </div>
 
-<!-- Add Meta (Customization) Modal -->
-<div class="modal fade" id="addMetaModal" tabindex="-1">
+<!-- Override Meta Customize Modal (shared for Add + Edit) -->
+<div class="modal fade" id="overrideMetaModal" tabindex="-1">
     <div class="modal-dialog">
         <div class="modal-content">
             <div class="modal-header">
-                <h5 class="modal-title">Customize Override Metadata</h5>
+                <h5 class="modal-title">Customize Metadata</h5>
                 <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
             </div>
             <div class="modal-body">
-                <div class="row">
-                    <div class="col-md-6">
-                        <div class="mb-3">
-                            <label for="addMetaOwner" class="form-label">Owner</label>
-                            <input type="text" class="form-control" id="addMetaOwner" placeholder="(optional)">
-                        </div>
-                    </div>
-                    <div class="col-md-6">
-                        <div class="mb-3">
-                            <label for="addMetaGroup" class="form-label">Group</label>
-                            <input type="text" class="form-control" id="addMetaGroup" placeholder="(optional)">
-                        </div>
-                    </div>
+                <div class="mb-2">
+                    <label class="form-label">Override (format: <code>user:group:mode</code>, use <code>-</code> for default)</label>
+                    <input type="text" class="form-control" id="overrideMetaInput" placeholder="-:-:0700">
+                    <div class="form-text">Examples: <code>-:-:0700</code>, <code>steve:-:0700</code>, <code>-:-:-</code> (clears customization)</div>
                 </div>
-                <div class="mb-3">
-                    <label for="addMetaMode" class="form-label">Mode</label>
-                    <input type="text" class="form-control" id="addMetaMode" placeholder="(optional, octal e.g. 0700)">
-                </div>
-                <div class="form-text">
-                    Customization must be complete (owner + group + mode), or empty to use defaults.
-                </div>
-                <div id="addMetaError" class="text-danger small mt-2" style="display:none;"></div>
+                <div id="overrideMetaError" class="alert alert-danger" style="display:none; margin-bottom:0;"></div>
             </div>
             <div class="modal-footer">
-                <button type="button" class="btn btn-outline-danger" onclick="clearAddMetaFromModal()">Clear</button>
                 <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
-                <button type="button" class="btn btn-primary" onclick="applyAddMetaFromModal()">Apply</button>
+                <button type="button" class="btn btn-primary" onclick="applyOverrideMetaFromModal()">Apply</button>
             </div>
         </div>
     </div>
@@ -273,36 +244,16 @@
                     <div class="mb-2">
                         <label class="form-label">Meta</label>
                         <div class="d-flex align-items-center gap-2 flex-wrap">
-                            <span id="editMetaBadgeOwnerGroup" class="badge bg-info text-dark" style="display:none;"></span>
-                            <span id="editMetaBadgeMode" class="badge bg-warning text-dark" style="display:none;"></span>
-                            <button type="button" id="editMetaRemoveBtn" class="btn btn-sm btn-outline-danger" style="display:none;" onclick="clearEditMeta()">
-                                <i class="bi bi-x"></i> Remove
+                            <button type="button" class="btn btn-sm btn-outline-secondary" onclick="openOverrideMetaModal('edit')">
+                                <i class="bi bi-sliders"></i> Customize
                             </button>
+                            <div id="editMetaBadges"></div>
                             <span id="editMetaDefaultHint" class="text-muted">default</span>
                         </div>
                     </div>
-                    <div class="row">
-                        <div class="col-md-6">
-                            <div class="mb-3">
-                                <label for="editMetaOwner" class="form-label">Owner</label>
-                                <input type="text" class="form-control" id="editMetaOwner" name="owner" placeholder="(optional)" oninput="refreshEditMetaBadges()">
-                            </div>
-                        </div>
-                        <div class="col-md-6">
-                            <div class="mb-3">
-                                <label for="editMetaGroup" class="form-label">Group</label>
-                                <input type="text" class="form-control" id="editMetaGroup" name="group" placeholder="(optional)" oninput="refreshEditMetaBadges()">
-                            </div>
-                        </div>
-                    </div>
-                    <div class="mb-3">
-                        <label for="editMetaMode" class="form-label">Mode</label>
-                        <input type="text" class="form-control" id="editMetaMode" name="mode" placeholder="(optional, octal e.g. 0700)" oninput="refreshEditMetaBadges()">
-                    </div>
-                    <div class="form-text">
-                        Customization must be complete (owner + group + mode), or empty to use defaults.
-                    </div>
-                    <div id="editMetaError" class="text-danger small mt-2" style="display:none;"></div>
+                    <input type="hidden" id="editMetaOwner" name="owner" value="">
+                    <input type="hidden" id="editMetaGroup" name="group" value="">
+                    <input type="hidden" id="editMetaMode" name="mode" value="">
                 </div>
                 <div class="modal-footer">
                     <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
@@ -594,117 +545,168 @@ function formatTimestamp(timestamp) {
     }
 }
 
-function showEditMetaModal(path, fileType, ownerGroup, mode) {
-    // ownerGroup comes as "owner:group" or "".
-    ownerGroup = ownerGroup || '';
+let __overrideMetaContext = 'add'; // 'add' | 'edit'
+let __restoreEditMetaModalAfterOverrideMeta = false;
+
+function metaTripletString(owner, group, mode) {
+    const o = owner && owner.trim() !== '' ? owner.trim() : '-';
+    const g = group && group.trim() !== '' ? group.trim() : '-';
+    const m = mode && mode.trim() !== '' ? mode.trim() : '-';
+    return `${o}:${g}:${m}`;
+}
+
+function validateMetaToken(kind, v) {
+    if (v === '-' || v === '') return null;
+    if (/\s/.test(v)) return `${kind} cannot contain whitespace.`;
+    if (v.includes(':')) return `${kind} cannot contain ':'.`;
+    return null;
+}
+
+function normalizeModeToken(v) {
+    if (v === '-' || v === '') return '';
+    if (!/^[0-7]{3,4}$/.test(v)) return null;
+    return v.length === 3 ? '0' + v : v;
+}
+
+function openOverrideMetaModal(context) {
+    __overrideMetaContext = context;
+    const err = document.getElementById('overrideMetaError');
+    err.style.display = 'none';
+
+    const owner = (context === 'edit' ? document.getElementById('editMetaOwner').value : document.getElementById('owner').value) || '';
+    const group = (context === 'edit' ? document.getElementById('editMetaGroup').value : document.getElementById('group').value) || '';
+    const mode = (context === 'edit' ? document.getElementById('editMetaMode').value : document.getElementById('mode').value) || '';
+
+    document.getElementById('overrideMetaInput').value = metaTripletString(owner, group, mode);
+
+    // If we're opening this from inside the edit modal, hide the parent first to avoid z-index/backdrop issues.
+    __restoreEditMetaModalAfterOverrideMeta = false;
+    if (context === 'edit') {
+        const editEl = document.getElementById('editMetaModal');
+        const editInst = bootstrap.Modal.getInstance(editEl);
+        if (editInst) {
+            __restoreEditMetaModalAfterOverrideMeta = true;
+            editInst.hide();
+        }
+    }
+
+    new bootstrap.Modal(document.getElementById('overrideMetaModal')).show();
+}
+
+function applyOverrideMetaFromModal() {
+    const raw = (document.getElementById('overrideMetaInput').value || '').trim();
+    const err = document.getElementById('overrideMetaError');
+    err.style.display = 'none';
+
+    const parts = raw.split(':');
+    if (parts.length !== 3) {
+        err.textContent = 'Invalid format. Expected: user:group:mode (use - for default).';
+        err.style.display = 'block';
+        return;
+    }
+
+    const ownerRaw = parts[0].trim() || '-';
+    const groupRaw = parts[1].trim() || '-';
+    const modeRaw = parts[2].trim() || '-';
+
+    const ownerErr = validateMetaToken('Owner', ownerRaw);
+    const groupErr = validateMetaToken('Group', groupRaw);
+    const modeNorm = normalizeModeToken(modeRaw);
+    if (ownerErr || groupErr || modeNorm === null) {
+        err.textContent = ownerErr || groupErr || 'Invalid mode. Must be octal like 0700 or 700, or - for default.';
+        err.style.display = 'block';
+        return;
+    }
+
+    const ownerOut = ownerRaw === '-' ? '' : ownerRaw;
+    const groupOut = groupRaw === '-' ? '' : groupRaw;
+    const modeOut = modeRaw === '-' ? '' : modeNorm;
+
+    if (__overrideMetaContext === 'edit') {
+        document.getElementById('editMetaOwner').value = ownerOut;
+        document.getElementById('editMetaGroup').value = groupOut;
+        document.getElementById('editMetaMode').value = modeOut;
+        renderOverrideMetaBadges('edit');
+    } else {
+        document.getElementById('owner').value = ownerOut;
+        document.getElementById('group').value = groupOut;
+        document.getElementById('mode').value = modeOut;
+        renderOverrideMetaBadges('add');
+    }
+
+    bootstrap.Modal.getInstance(document.getElementById('overrideMetaModal'))?.hide();
+}
+
+function clearOverrideMeta(context) {
+    if (context === 'edit') {
+        document.getElementById('editMetaOwner').value = '';
+        document.getElementById('editMetaGroup').value = '';
+        document.getElementById('editMetaMode').value = '';
+    } else {
+        document.getElementById('owner').value = '';
+        document.getElementById('group').value = '';
+        document.getElementById('mode').value = '';
+    }
+    renderOverrideMetaBadges(context);
+}
+
+function renderOverrideMetaBadges(context) {
+    const owner = (context === 'edit' ? document.getElementById('editMetaOwner').value : document.getElementById('owner').value) || '';
+    const group = (context === 'edit' ? document.getElementById('editMetaGroup').value : document.getElementById('group').value) || '';
+    const mode = (context === 'edit' ? document.getElementById('editMetaMode').value : document.getElementById('mode').value) || '';
+    const any = owner.trim() !== '' || group.trim() !== '' || mode.trim() !== '';
+
+    const badges = document.getElementById(context === 'edit' ? 'editMetaBadges' : 'addMetaBadges');
+    const hint = document.getElementById(context === 'edit' ? 'editMetaDefaultHint' : 'addMetaDefaultHint');
+    if (!badges) return;
+    badges.innerHTML = '';
+
+    if (!any) {
+        if (hint) hint.style.display = '';
+        return;
+    }
+    if (hint) hint.style.display = 'none';
+
+    const span = document.createElement('span');
+    span.className = 'badge text-bg-secondary';
+    span.textContent = metaTripletString(owner, group, mode);
+    const x = document.createElement('button');
+    x.type = 'button';
+    x.className = 'btn btn-sm btn-link text-light text-decoration-none ms-2 p-0';
+    x.textContent = '×';
+    x.onclick = () => clearOverrideMeta(context);
+    span.appendChild(x);
+    badges.appendChild(span);
+}
+
+function showEditMetaModal(path, fileType, owner, group, mode) {
+    owner = owner || '';
+    group = group || '';
     mode = mode || '';
 
-    document.getElementById('editMetaError').style.display = 'none';
     document.getElementById('editMetaPath').value = path;
     document.getElementById('editMetaFileType').value = fileType;
-
-    const ownerInput = document.getElementById('editMetaOwner');
-    const groupInput = document.getElementById('editMetaGroup');
-    const modeInput = document.getElementById('editMetaMode');
-
-    if (ownerGroup.includes(':')) {
-        const parts = ownerGroup.split(':');
-        ownerInput.value = parts[0] || '';
-        groupInput.value = parts[1] || '';
-    } else {
-        ownerInput.value = '';
-        groupInput.value = '';
-    }
-    modeInput.value = mode;
-    refreshEditMetaBadges();
-    
+    document.getElementById('editMetaOwner').value = owner;
+    document.getElementById('editMetaGroup').value = group;
+    document.getElementById('editMetaMode').value = mode;
+    renderOverrideMetaBadges('edit');
     new bootstrap.Modal(document.getElementById('editMetaModal')).show();
 }
 
-function refreshEditMetaBadges() {
-    const owner = document.getElementById('editMetaOwner').value.trim();
-    const group = document.getElementById('editMetaGroup').value.trim();
-    const mode = document.getElementById('editMetaMode').value.trim();
-    const og = document.getElementById('editMetaBadgeOwnerGroup');
-    const mb = document.getElementById('editMetaBadgeMode');
-    const rm = document.getElementById('editMetaRemoveBtn');
-    const hint = document.getElementById('editMetaDefaultHint');
-    const any = owner !== '' || group !== '' || mode !== '';
-    og.style.display = (owner !== '' || group !== '') ? '' : 'none';
-    mb.style.display = mode !== '' ? '' : 'none';
-    rm.style.display = any ? '' : 'none';
-    hint.style.display = any ? 'none' : '';
-    if (owner !== '' || group !== '') og.textContent = `${owner}:${group}`;
-    if (mode !== '') mb.textContent = mode;
-}
-
-function clearEditMeta() {
-    document.getElementById('editMetaOwner').value = '';
-    document.getElementById('editMetaGroup').value = '';
-    document.getElementById('editMetaMode').value = '';
-    document.getElementById('editMetaError').style.display = 'none';
-    refreshEditMetaBadges();
-}
-
-function showAddMetaModal() {
-    document.getElementById('addMetaError').style.display = 'none';
-    document.getElementById('addMetaOwner').value = document.getElementById('owner').value || '';
-    document.getElementById('addMetaGroup').value = document.getElementById('group').value || '';
-    document.getElementById('addMetaMode').value = document.getElementById('mode').value || '';
-    new bootstrap.Modal(document.getElementById('addMetaModal')).show();
-}
-
-function clearAddMetaFromModal() {
-    document.getElementById('addMetaOwner').value = '';
-    document.getElementById('addMetaGroup').value = '';
-    document.getElementById('addMetaMode').value = '';
-    document.getElementById('addMetaError').style.display = 'none';
-}
-
-function applyAddMetaFromModal() {
-    const owner = document.getElementById('addMetaOwner').value.trim();
-    const group = document.getElementById('addMetaGroup').value.trim();
-    const mode = document.getElementById('addMetaMode').value.trim();
-    const err = document.getElementById('addMetaError');
-    if ((owner === '' && group === '' && mode === '') || (owner !== '' && group !== '' && mode !== '')) {
-        document.getElementById('owner').value = owner;
-        document.getElementById('group').value = group;
-        document.getElementById('mode').value = mode;
-        refreshAddMetaBadges();
-        bootstrap.Modal.getInstance(document.getElementById('addMetaModal')).hide();
-        return;
-    }
-    err.textContent = 'Customization must include owner + group + mode, or be fully empty.';
-    err.style.display = 'block';
-}
-
-function refreshAddMetaBadges() {
-    const owner = document.getElementById('owner').value.trim();
-    const group = document.getElementById('group').value.trim();
-    const mode = document.getElementById('mode').value.trim();
-    const og = document.getElementById('addMetaBadgeOwnerGroup');
-    const mb = document.getElementById('addMetaBadgeMode');
-    const rm = document.getElementById('addMetaRemoveBtn');
-    const hint = document.getElementById('addMetaDefaultHint');
-    const any = owner !== '' || group !== '' || mode !== '';
-    og.style.display = (owner !== '' || group !== '') ? '' : 'none';
-    mb.style.display = mode !== '' ? '' : 'none';
-    rm.style.display = any ? '' : 'none';
-    hint.style.display = any ? 'none' : '';
-    if (owner !== '' || group !== '') og.textContent = `${owner}:${group}`;
-    if (mode !== '') mb.textContent = mode;
-}
-
-function clearAddMeta() {
-    document.getElementById('owner').value = '';
-    document.getElementById('group').value = '';
-    document.getElementById('mode').value = '';
-    refreshAddMetaBadges();
-}
-
-// Initialize add-meta badges on page load.
+// Initialize badges on page load.
 document.addEventListener('DOMContentLoaded', function() {
-    refreshAddMetaBadges();
+    renderOverrideMetaBadges('add');
+
+    // When the override meta modal closes, restore the edit modal if we opened from there.
+    const overrideEl = document.getElementById('overrideMetaModal');
+    if (overrideEl) {
+        overrideEl.addEventListener('hidden.bs.modal', function() {
+            if (__restoreEditMetaModalAfterOverrideMeta) {
+                __restoreEditMetaModalAfterOverrideMeta = false;
+                new bootstrap.Modal(document.getElementById('editMetaModal')).show();
+            }
+        });
+    }
 });
 </script>
 

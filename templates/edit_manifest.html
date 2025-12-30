@@ -188,8 +188,8 @@
             </div>
             <div class="modal-body">
                 <div class="mb-2">
-                    <label class="form-label">Override (format: <code>user:group:0700</code>)</label>
-                    <input type="text" class="form-control" id="fileMetaInput" placeholder="root:root:0700">
+                    <label class="form-label">Override (format: <code>user:group:mode</code>, use <code>-</code> for default)</label>
+                    <input type="text" class="form-control" id="fileMetaInput" placeholder="-:-:0700">
                     <div class="form-text">Click the badge “X” to remove customization later.</div>
                 </div>
                 <div id="fileMetaError" class="alert alert-danger" style="display:none; margin-bottom:0;"></div>
@@ -356,7 +356,7 @@ function openFileMetaModal(btn) {
     const input = document.getElementById('fileMetaInput');
     const err = document.getElementById('fileMetaError');
     err.style.display = 'none';
-    input.value = (owner && group && mode) ? `${owner}:${group}:${mode}` : '';
+    input.value = (owner || group || mode) ? `${owner || '-'}:${group || '-'}:${mode || '-'}` : '';
     const modal = new bootstrap.Modal(document.getElementById('fileMetaModal'));
     modal.show();
 }
@@ -366,34 +366,48 @@ function applyFileMetaFromModal() {
     const raw = (document.getElementById('fileMetaInput').value || '').trim();
     const err = document.getElementById('fileMetaError');
     err.style.display = 'none';
+    if (!raw) {
+        // Treat empty as "cancel".
+        bootstrap.Modal.getInstance(document.getElementById('fileMetaModal'))?.hide();
+        return;
+    }
     const parts = raw.split(':');
     if (parts.length !== 3) {
-        err.textContent = 'Invalid format. Expected: user:group:0700';
+        err.textContent = 'Invalid format. Expected: user:group:mode (use - for default).';
         err.style.display = 'block';
         return;
     }
-    const user = parts[0].trim();
-    const group = parts[1].trim();
-    let mode = parts[2].trim();
-    if (!user || /\s/.test(user)) {
-        err.textContent = 'Invalid user (no whitespace).';
+    const userRaw = (parts[0].trim() || '-');
+    const groupRaw = (parts[1].trim() || '-');
+    let modeRaw = (parts[2].trim() || '-');
+
+    if (userRaw !== '-' && /\s/.test(userRaw)) {
+        err.textContent = 'Invalid user (no whitespace). Use - for default.';
         err.style.display = 'block';
         return;
     }
-    if (!group || /\s/.test(group)) {
-        err.textContent = 'Invalid group (no whitespace).';
+    if (groupRaw !== '-' && /\s/.test(groupRaw)) {
+        err.textContent = 'Invalid group (no whitespace). Use - for default.';
         err.style.display = 'block';
         return;
     }
-    if (!/^[0-7]{3,4}$/.test(mode)) {
-        err.textContent = 'Invalid mode. Must be octal like 0700 or 700.';
-        err.style.display = 'block';
-        return;
+    let modeOut = '';
+    if (modeRaw !== '-') {
+        if (!/^[0-7]{3,4}$/.test(modeRaw)) {
+            err.textContent = 'Invalid mode. Must be octal like 0700 or 700, or - for default.';
+            err.style.display = 'block';
+            return;
+        }
+        if (modeRaw.length === 3) modeRaw = '0' + modeRaw;
+        modeOut = modeRaw;
     }
-    if (mode.length === 3) mode = '0' + mode;
-    __activeFileEntryForMeta.querySelector('.file-owner-hidden').value = user;
-    __activeFileEntryForMeta.querySelector('.file-group-hidden').value = group;
-    __activeFileEntryForMeta.querySelector('.file-mode-hidden').value = mode;
+
+    const userOut = (userRaw === '-') ? '' : userRaw;
+    const groupOut = (groupRaw === '-') ? '' : groupRaw;
+
+    __activeFileEntryForMeta.querySelector('.file-owner-hidden').value = userOut;
+    __activeFileEntryForMeta.querySelector('.file-group-hidden').value = groupOut;
+    __activeFileEntryForMeta.querySelector('.file-mode-hidden').value = modeOut;
     renderFileMetaBadge(__activeFileEntryForMeta);
     bootstrap.Modal.getInstance(document.getElementById('fileMetaModal'))?.hide();
 }
@@ -415,7 +429,7 @@ function renderFileMetaBadge(entry) {
     if (!owner && !group && !mode) return;
     const span = document.createElement('span');
     span.className = 'badge text-bg-secondary';
-    span.textContent = `${owner}:${group}:${mode}`;
+    span.textContent = `${owner || '-'}:${group || '-'}:${mode || '-'}`;
     const x = document.createElement('button');
     x.type = 'button';
     x.className = 'btn btn-sm btn-link text-light text-decoration-none ms-2 p-0';

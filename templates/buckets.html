@@ -47,6 +47,12 @@
                     {% endif %}
                 </td>
                 <td>
+                    <form method="get" action="/buckets/manage" style="display: inline;">
+                        <input type="hidden" name="name" value="{{ display_name }}">
+                        <button type="submit" class="btn btn-sm btn-primary me-1">
+                            <i class="bi bi-folder2-open"></i> Manage
+                        </button>
+                    </form>
                     <form method="post" action="/buckets/delete" style="display: inline;">
                         <input type="hidden" name="name" value="{{ display_name }}">
                         <button type="submit" class="btn btn-sm btn-danger" 

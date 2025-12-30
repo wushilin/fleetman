@@ -33,7 +33,11 @@
                 <tbody>
                     {% for version in versions %}
                     <tr>
-                        <td><code>{{ version.version }}</code></td>
+                        <td>
+                            <a href="/cells/{{ node_id }}/{{ cell_id }}/versions/{{ version.version }}" class="text-decoration-none">
+                                <code>{{ version.version }}</code>
+                            </a>
+                        </td>
                         <td>{{ version.published_at }}</td>
                         <td>
                             <form method="post" action="/cells/{{ node_id }}/{{ cell_id }}/versions/delete" 

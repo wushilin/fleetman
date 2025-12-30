@@ -47,12 +47,96 @@ struct BucketsTemplate {
     buckets: Vec<(String, BucketConfig)>,
 }
 
+#[derive(Debug, Clone)]
+struct BucketFolderRow {
+    name: String,
+    full_prefix: String,
+}
+
+#[derive(Debug, Clone)]
+struct BucketObjectRow {
+    name: String,
+    key: String,
+    size_human: String,
+    last_modified: String,
+    etag_short: String,
+}
+
+#[derive(Template)]
+#[template(path = "bucket_browse.html")]
+struct BucketBrowseTemplate {
+    bucket_display: String,
+    bucket_name: String,
+    configured_root_prefix: String,
+    current_prefix: String,
+    parent_prefix: String,
+    is_within_configured_root: bool,
+    filter_q: String,
+    folders: Vec<BucketFolderRow>,
+    objects: Vec<BucketObjectRow>,
+    next_token: Option<String>,
+    page_limit: usize,
+}
+
+#[derive(Template)]
+#[template(path = "bucket_object_edit.html")]
+struct BucketObjectEditTemplate {
+    bucket_display: String,
+    bucket_name: String,
+    key: String,
+    return_prefix: String,
+    content: String,
+    size_bytes: Option<i64>,
+    error: Option<String>,
+    is_readonly: bool,
+}
+
+#[derive(Template)]
+#[template(path = "bucket_folder_delete_preview.html")]
+struct BucketFolderDeletePreviewTemplate {
+    bucket_display: String,
+    bucket_name: String,
+    folder_prefix: String,
+    return_prefix: String,
+    object_count: usize,
+    sample_keys: Vec<String>,
+    error: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "bucket_folder_delete_result.html")]
+struct BucketFolderDeleteResultTemplate {
+    bucket_display: String,
+    bucket_name: String,
+    folder_prefix: String,
+    return_prefix: String,
+    deleted_count: usize,
+    remaining_count: usize,
+}
+
 #[derive(Template)]
 #[template(path = "manifests.html")]
 struct ManifestsTemplate {
-    manifests: Vec<(String, DeploymentManifest)>,
+    manifests: Vec<ManifestCard>,
     buckets: Vec<(String, BucketConfig)>,
     resource_profiles: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ManifestFileDisplay {
+    path: String,
+    file_type: String,
+    attrs: String,        // effective user:group:mode
+    attrs_explicit: bool, // any of owner/group/mode explicitly set
+}
+
+#[derive(Debug, Clone)]
+struct ManifestCard {
+    name: String,
+    profile: String,
+    resource_profile: String,
+    bucket: String,
+    files: Vec<ManifestFileDisplay>,
 }
 
 #[derive(Template)]
@@ -369,6 +453,26 @@ fn validate_optional_owner_group(field: &str, v: &Option<String>) -> Result<(), 
         return Err(format!("{} cannot contain whitespace", field));
     }
     Ok(())
+}
+
+fn parse_dash_opt_string(s: &str) -> Option<String> {
+    let t = s.trim();
+    if t.is_empty() || t == "-" {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+fn normalize_mode_opt(v: Option<String>) -> Result<Option<String>, String> {
+    let Some(raw) = v.as_deref().map(|x| x.trim()).filter(|x| !x.is_empty()) else {
+        return Ok(None);
+    };
+    // Validate
+    let _ = parse_mode_octal(raw)?;
+    // Normalize to 4-digit for display/consistency (e.g. 700 -> 0700)
+    let out = if raw.len() == 3 { format!("0{}", raw) } else { raw.to_string() };
+    Ok(Some(out))
 }
 
 fn parse_cpu_millis(s: &str) -> Result<Option<u32>, String> {
@@ -692,6 +796,15 @@ async fn main() {
         .route("/buckets", get(buckets_page))
         .route("/buckets/add", post(add_bucket))
         .route("/buckets/delete", post(delete_bucket))
+        .route("/buckets/manage", get(bucket_manage_page))
+        .route("/buckets/object/download", get(bucket_object_download))
+        .route("/buckets/object/edit", get(bucket_object_edit_page))
+        .route("/buckets/object/save", post(bucket_object_save))
+        .route("/buckets/object/delete", post(bucket_object_delete))
+        .route("/buckets/object/upload", post(bucket_object_upload))
+        .route("/buckets/folder/delete/preview", get(bucket_folder_delete_preview))
+        .route("/buckets/folder/delete", post(bucket_folder_delete_execute))
+        .route("/buckets/folder/create", post(bucket_folder_create))
         .route("/resource-profiles", get(resource_profiles_page))
         .route("/resource-profiles/add", post(add_resource_profile))
         .route("/resource-profiles/edit", get(edit_resource_profile_page))
@@ -714,6 +827,7 @@ async fn main() {
         .route("/cells/:node_id/:cell_id/overrides/update-meta", post(update_cell_override_meta))
         .route("/cells/:node_id/:cell_id/versions", get(cell_versions_page))
         .route("/cells/:node_id/:cell_id/versions/delete", post(delete_cell_version))
+        .route("/cells/:node_id/:cell_id/versions/:version", get(cell_version_view_page))
         .route("/cells/:node_id/:cell_id/publish", post(publish_deployment_to_cell))
         .route("/agents", get(agents_page))
         .route("/agents/delete", post(delete_agent))
@@ -850,6 +964,41 @@ fn profile_display_u32(v: &Option<u32>, default_if_none: Option<u32>) -> String 
         (Some(x), _) => x.to_string(),
         (None, Some(d)) => d.to_string(),
         (None, None) => "unlimited".to_string(),
+    }
+}
+
+fn bytes_human(bytes: i64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", (bytes as f64) / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", (bytes as f64) / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1} GB", (bytes as f64) / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+fn normalize_folder_prefix(prefix: String) -> String {
+    let t = prefix.trim().to_string();
+    if t.is_empty() {
+        return "".to_string();
+    }
+    if t.ends_with('/') {
+        t
+    } else {
+        format!("{}/", t)
+    }
+}
+
+fn parent_folder_prefix(prefix: &str) -> String {
+    let p = prefix.trim_end_matches('/');
+    if p.is_empty() {
+        return "".to_string();
+    }
+    match p.rfind('/') {
+        Some(idx) => format!("{}/", &p[..idx]),
+        None => "".to_string(),
     }
 }
 
@@ -1503,11 +1652,954 @@ async fn delete_bucket(
     Redirect::to("/buckets")
 }
 
+#[derive(Deserialize)]
+struct BucketManageQuery {
+    name: String, // bucket DISPLAY name (key in controller config)
+    #[serde(default)]
+    prefix: Option<String>,
+    #[serde(default)]
+    q: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BucketObjectQuery {
+    name: String, // bucket DISPLAY name
+    key: String,  // full object key in bucket
+    #[serde(default)]
+    return_prefix: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BucketObjectDeleteForm {
+    name: String,
+    key: String,
+    #[serde(default)]
+    return_prefix: String,
+}
+
+#[derive(Deserialize)]
+struct BucketObjectSaveForm {
+    name: String,
+    key: String,
+    #[serde(default)]
+    return_prefix: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct BucketFolderDeletePreviewQuery {
+    name: String, // bucket DISPLAY name
+    folder_prefix: String,
+    #[serde(default)]
+    return_prefix: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BucketFolderDeleteForm {
+    name: String,
+    folder_prefix: String,
+    #[serde(default)]
+    return_prefix: String,
+}
+
+#[derive(Deserialize)]
+struct BucketFolderCreateForm {
+    name: String, // bucket DISPLAY name
+    #[serde(default)]
+    prefix: String, // current prefix to create under
+    folder_name: String,
+}
+
+async fn bucket_manage_page(
+    AxumState(state): AxumState<AppState>,
+    Query(query): Query<BucketManageQuery>,
+) -> impl IntoResponse {
+    let (bucket_cfg, retry_count, retry_delay_ms) = {
+        let config = state.read().unwrap();
+        match config.buckets.get(&query.name) {
+            Some(bc) => (bc.clone(), config.s3_retry_count, config.s3_retry_delay_ms),
+            None => return Redirect::to("/buckets?error=Bucket+not+found").into_response(),
+        }
+    };
+
+    let configured_root_prefix = normalize_folder_prefix(format!("{}/", bucket_cfg.prefix));
+
+    let raw_prefix = match query.prefix {
+        None => configured_root_prefix.clone(),
+        Some(p) => p,
+    };
+    let current_prefix = normalize_folder_prefix(raw_prefix);
+    let parent_prefix = parent_folder_prefix(&current_prefix);
+
+    let filter_q = query.q.unwrap_or_default();
+    let filter_q_lower = filter_q.to_lowercase();
+
+    let is_within_configured_root = current_prefix.starts_with(&configured_root_prefix);
+    let page_limit: i32 = 200;
+
+    let client = create_s3_client(&bucket_cfg).await;
+
+    let op_name = format!("bucket_browse: {}:{}", bucket_cfg.bucket_name, current_prefix);
+    let resp = retry_s3_operation(
+        &op_name,
+        retry_count,
+        retry_delay_ms,
+        || {
+            let client = client.clone();
+            let bucket = bucket_cfg.bucket_name.clone();
+            let prefix = current_prefix.clone();
+            let token = query.token.clone();
+            async move {
+                let mut req = client
+                    .list_objects_v2()
+                    .bucket(&bucket)
+                    .prefix(&prefix)
+                    .delimiter("/")
+                    .max_keys(page_limit);
+                if let Some(t) = token {
+                    if !t.trim().is_empty() {
+                        req = req.continuation_token(t);
+                    }
+                }
+                req.send().await
+            }
+        },
+    )
+    .await;
+
+    let mut folders: Vec<BucketFolderRow> = Vec::new();
+    let mut objects: Vec<BucketObjectRow> = Vec::new();
+    let mut next_token: Option<String> = None;
+
+    match resp {
+        Ok(output) => {
+            // Folders
+            for cp in output.common_prefixes().iter() {
+                if let Some(p) = cp.prefix() {
+                    let name = p
+                        .strip_prefix(&current_prefix)
+                        .unwrap_or(p)
+                        .trim_end_matches('/')
+                        .to_string();
+                    if name.is_empty() {
+                        continue;
+                    }
+                    if !filter_q_lower.is_empty() && !name.to_lowercase().contains(&filter_q_lower) && !p.to_lowercase().contains(&filter_q_lower) {
+                        continue;
+                    }
+                    folders.push(BucketFolderRow {
+                        name,
+                        full_prefix: p.to_string(),
+                    });
+                }
+            }
+
+            // Objects
+            for obj in output.contents().iter() {
+                let key = match obj.key() {
+                    Some(k) => k,
+                    None => continue,
+                };
+                if key.ends_with('/') {
+                    // Treat as folder marker; it will already appear via common_prefixes.
+                    continue;
+                }
+                if !filter_q_lower.is_empty() && !key.to_lowercase().contains(&filter_q_lower) {
+                    continue;
+                }
+                let name = key.strip_prefix(&current_prefix).unwrap_or(key).to_string();
+                let size = obj.size().unwrap_or(0);
+                let size_human = bytes_human(size);
+                let last_modified = obj
+                    .last_modified()
+                    .map(|dt| dt.fmt(aws_sdk_s3::primitives::DateTimeFormat::DateTime).ok())
+                    .flatten()
+                    .unwrap_or_else(|| "Unknown".to_string());
+                let etag = obj.e_tag().unwrap_or("").trim_matches('"').to_string();
+                let etag_short = if etag.len() > 10 { etag[..10].to_string() } else { etag };
+                objects.push(BucketObjectRow {
+                    name,
+                    key: key.to_string(),
+                    size_human,
+                    last_modified,
+                    etag_short,
+                });
+            }
+
+            folders.sort_by(|a, b| a.name.cmp(&b.name));
+            objects.sort_by(|a, b| a.name.cmp(&b.name));
+
+            if output.is_truncated().unwrap_or(false) {
+                next_token = output.next_continuation_token().map(|s| s.to_string());
+            }
+        }
+        Err(e) => {
+            eprintln!("bucket_manage_page list error: {}", e);
+        }
+    }
+
+    HtmlTemplate(BucketBrowseTemplate {
+        bucket_display: query.name,
+        bucket_name: bucket_cfg.bucket_name,
+        configured_root_prefix,
+        current_prefix,
+        parent_prefix,
+        is_within_configured_root,
+        filter_q,
+        folders,
+        objects,
+        next_token,
+        page_limit: page_limit as usize,
+    })
+    .into_response()
+}
+
+fn validate_folder_name(name: &str) -> Result<String, String> {
+    let t = name.trim();
+    if t.is_empty() {
+        return Err("Folder name cannot be empty".to_string());
+    }
+    if t.contains('/') || t.contains('\\') {
+        return Err("Folder name cannot contain '/' or '\\\\'".to_string());
+    }
+    if t == "." || t == ".." {
+        return Err("Folder name cannot be '.' or '..'".to_string());
+    }
+    Ok(t.to_string())
+}
+
+async fn bucket_folder_create(
+    AxumState(state): AxumState<AppState>,
+    Form(form): Form<BucketFolderCreateForm>,
+) -> impl IntoResponse {
+    let (bucket_cfg, retry_count, retry_delay_ms) = {
+        let config = state.read().unwrap();
+        match config.buckets.get(&form.name) {
+            Some(bc) => (bc.clone(), config.s3_retry_count, config.s3_retry_delay_ms),
+            None => return Redirect::to("/buckets?error=Bucket+not+found").into_response(),
+        }
+    };
+
+    let folder_name = match validate_folder_name(&form.folder_name) {
+        Ok(v) => v,
+        Err(_) => {
+            return Redirect::to(&format!(
+                "/buckets/manage?name={}&prefix={}",
+                form.name,
+                normalize_folder_prefix(form.prefix)
+            ))
+            .into_response()
+        }
+    };
+
+    let prefix = normalize_folder_prefix(form.prefix);
+    let key = if prefix.is_empty() {
+        format!("{}/", folder_name)
+    } else {
+        format!("{}{}/", prefix, folder_name)
+    };
+
+    let client = create_s3_client(&bucket_cfg).await;
+    let bucket_name = bucket_cfg.bucket_name.clone();
+
+    let op_name = format!("bucket_folder_create: {}", key);
+    let _ = retry_s3_operation(
+        &op_name,
+        retry_count,
+        retry_delay_ms,
+        || {
+            let client = client.clone();
+            let bucket = bucket_name.clone();
+            let key = key.clone();
+            async move {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .body(ByteStream::from(vec![]))
+                    .send()
+                    .await
+            }
+        },
+    )
+    .await;
+
+    Redirect::to(&format!("/buckets/manage?name={}&prefix={}", form.name, prefix)).into_response()
+}
+
+async fn bucket_folder_delete_preview(
+    AxumState(state): AxumState<AppState>,
+    Query(query): Query<BucketFolderDeletePreviewQuery>,
+) -> impl IntoResponse {
+    let return_prefix = query.return_prefix.clone().unwrap_or_default();
+    let folder_prefix = normalize_folder_prefix(query.folder_prefix.clone());
+    if folder_prefix.is_empty() {
+        return HtmlTemplate(BucketFolderDeletePreviewTemplate {
+            bucket_display: query.name,
+            bucket_name: "-".to_string(),
+            folder_prefix,
+            return_prefix,
+            object_count: 0,
+            sample_keys: vec![],
+            error: Some("Refusing to delete empty prefix (bucket root).".to_string()),
+        })
+        .into_response();
+    }
+
+    let (bucket_cfg, retry_count, retry_delay_ms) = {
+        let config = state.read().unwrap();
+        match config.buckets.get(&query.name) {
+            Some(bc) => (bc.clone(), config.s3_retry_count, config.s3_retry_delay_ms),
+            None => {
+                return HtmlTemplate(BucketFolderDeletePreviewTemplate {
+                    bucket_display: query.name,
+                    bucket_name: "-".to_string(),
+                    folder_prefix,
+                    return_prefix,
+                    object_count: 0,
+                    sample_keys: vec![],
+                    error: Some("Bucket not found".to_string()),
+                })
+                .into_response()
+            }
+        }
+    };
+
+    let client = create_s3_client(&bucket_cfg).await;
+    let bucket_name = bucket_cfg.bucket_name.clone();
+
+    let mut token: Option<String> = None;
+    let mut object_count: usize = 0;
+    let mut sample_keys: Vec<String> = Vec::new();
+    loop {
+        let op_name = format!("bucket_folder_delete_preview:list:{}:{}", bucket_name, folder_prefix);
+        let resp = retry_s3_operation(
+            &op_name,
+            retry_count,
+            retry_delay_ms,
+            || {
+                let client = client.clone();
+                let bucket = bucket_name.clone();
+                let prefix = folder_prefix.clone();
+                let token = token.clone();
+                async move {
+                    let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
+                    if let Some(t) = token {
+                        req = req.continuation_token(t);
+                    }
+                    req.send().await
+                }
+            },
+        )
+        .await;
+
+        let out = match resp {
+            Ok(o) => o,
+            Err(e) => {
+                return HtmlTemplate(BucketFolderDeletePreviewTemplate {
+                    bucket_display: query.name,
+                    bucket_name: bucket_cfg.bucket_name,
+                    folder_prefix,
+                    return_prefix,
+                    object_count: 0,
+                    sample_keys: vec![],
+                    error: Some(format!("Failed to list objects under prefix: {}", e)),
+                })
+                .into_response()
+            }
+        };
+
+        if let Some(contents) = out.contents {
+            for o in contents {
+                if let Some(k) = o.key {
+                    object_count += 1;
+                    if sample_keys.len() < 20 {
+                        sample_keys.push(k);
+                    }
+                }
+            }
+        }
+
+        if out.is_truncated.unwrap_or(false) {
+            token = out.next_continuation_token;
+        } else {
+            break;
+        }
+    }
+
+    HtmlTemplate(BucketFolderDeletePreviewTemplate {
+        bucket_display: query.name,
+        bucket_name: bucket_cfg.bucket_name,
+        folder_prefix,
+        return_prefix,
+        object_count,
+        sample_keys,
+        error: None,
+    })
+    .into_response()
+}
+
+async fn bucket_folder_delete_execute(
+    AxumState(state): AxumState<AppState>,
+    Form(form): Form<BucketFolderDeleteForm>,
+) -> impl IntoResponse {
+    let folder_prefix = normalize_folder_prefix(form.folder_prefix.clone());
+    if folder_prefix.is_empty() {
+        return HtmlTemplate(BucketFolderDeleteResultTemplate {
+            bucket_display: form.name,
+            bucket_name: "-".to_string(),
+            folder_prefix,
+            return_prefix: form.return_prefix,
+            deleted_count: 0,
+            remaining_count: 0,
+        })
+        .into_response();
+    }
+
+    let (bucket_cfg, retry_count, retry_delay_ms) = {
+        let config = state.read().unwrap();
+        match config.buckets.get(&form.name) {
+            Some(bc) => (bc.clone(), config.s3_retry_count, config.s3_retry_delay_ms),
+            None => {
+                return HtmlTemplate(BucketFolderDeleteResultTemplate {
+                    bucket_display: form.name,
+                    bucket_name: "-".to_string(),
+                    folder_prefix,
+                    return_prefix: form.return_prefix,
+                    deleted_count: 0,
+                    remaining_count: 0,
+                })
+                .into_response()
+            }
+        }
+    };
+
+    let client = create_s3_client(&bucket_cfg).await;
+    let bucket_name = bucket_cfg.bucket_name.clone();
+
+    let mut deleted_count: usize = 0;
+    let mut token: Option<String> = None;
+    loop {
+        let op_name = format!("bucket_folder_delete:list:{}:{}", bucket_name, folder_prefix);
+        let resp = retry_s3_operation(
+            &op_name,
+            retry_count,
+            retry_delay_ms,
+            || {
+                let client = client.clone();
+                let bucket = bucket_name.clone();
+                let prefix = folder_prefix.clone();
+                let token = token.clone();
+                async move {
+                    let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
+                    if let Some(t) = token {
+                        req = req.continuation_token(t);
+                    }
+                    req.send().await
+                }
+            },
+        )
+        .await;
+
+        let out = match resp {
+            Ok(o) => o,
+            Err(_) => break,
+        };
+
+        let keys: Vec<String> = out
+            .contents
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|o| o.key)
+            .collect();
+
+        if !keys.is_empty() {
+            let objs = keys
+                .iter()
+                .map(|k| aws_sdk_s3::types::ObjectIdentifier::builder().key(k).build().expect("objid"))
+                .collect::<Vec<_>>();
+            let del = aws_sdk_s3::types::Delete::builder()
+                .set_objects(Some(objs))
+                .quiet(false)
+                .build()
+                .expect("delete");
+
+            let op = format!("bucket_folder_delete:delete_objects:{}:{}", bucket_name, folder_prefix);
+            let resp = retry_s3_operation(
+                &op,
+                retry_count,
+                retry_delay_ms,
+                || {
+                    let client = client.clone();
+                    let bucket = bucket_name.clone();
+                    let del = del.clone();
+                    async move { client.delete_objects().bucket(&bucket).delete(del).send().await }
+                },
+            )
+            .await;
+
+            match resp {
+                Ok(out_del) => {
+                    deleted_count += out_del.deleted().len();
+                }
+                Err(e) => {
+                    let s = format!("{:?}", e);
+                    if s.contains("MissingArgument") && s.contains("Content-MD5") {
+                        for k in keys {
+                            let op = format!("bucket_folder_delete:delete_object:{}:{}", bucket_name, k);
+                            let res = retry_s3_operation(
+                                &op,
+                                retry_count,
+                                retry_delay_ms,
+                                || {
+                                    let client = client.clone();
+                                    let bucket = bucket_name.clone();
+                                    let key = k.clone();
+                                    async move { client.delete_object().bucket(&bucket).key(key).send().await }
+                                },
+                            )
+                            .await;
+                            if res.is_ok() {
+                                deleted_count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if out.is_truncated.unwrap_or(false) {
+            token = out.next_continuation_token;
+        } else {
+            break;
+        }
+    }
+
+    let remaining_count = {
+        let op = format!("bucket_folder_delete:postcheck:{}:{}", bucket_name, folder_prefix);
+        match retry_s3_operation(
+            &op,
+            retry_count,
+            retry_delay_ms,
+            || {
+                let client = client.clone();
+                let bucket = bucket_name.clone();
+                let prefix = folder_prefix.clone();
+                async move { client.list_objects_v2().bucket(&bucket).prefix(&prefix).max_keys(1).send().await }
+            },
+        )
+        .await
+        {
+            Ok(out) => out.key_count.unwrap_or(0) as usize,
+            Err(_) => 0,
+        }
+    };
+
+    HtmlTemplate(BucketFolderDeleteResultTemplate {
+        bucket_display: form.name,
+        bucket_name: bucket_cfg.bucket_name,
+        folder_prefix,
+        return_prefix: form.return_prefix,
+        deleted_count,
+        remaining_count,
+    })
+    .into_response()
+}
+
+async fn bucket_object_download(
+    AxumState(state): AxumState<AppState>,
+    Query(query): Query<BucketObjectQuery>,
+) -> impl IntoResponse {
+    let (bucket_cfg, retry_count, retry_delay_ms) = {
+        let config = state.read().unwrap();
+        match config.buckets.get(&query.name) {
+            Some(bc) => (bc.clone(), config.s3_retry_count, config.s3_retry_delay_ms),
+            None => return (StatusCode::NOT_FOUND, "Bucket not found").into_response(),
+        }
+    };
+    let client = create_s3_client(&bucket_cfg).await;
+    let bucket_name = bucket_cfg.bucket_name.clone();
+    let key = query.key.clone();
+
+    let op_name = format!("bucket_object_download: {}", key);
+    match retry_s3_operation(
+        &op_name,
+        retry_count,
+        retry_delay_ms,
+        || {
+            let client = client.clone();
+            let bucket = bucket_name.clone();
+            let key = key.clone();
+            async move { client.get_object().bucket(&bucket).key(&key).send().await }
+        },
+    )
+    .await
+    {
+        Ok(output) => {
+            let content_type = output
+                .content_type()
+                .unwrap_or("application/octet-stream")
+                .to_string();
+            match output.body.collect().await {
+                Ok(data) => {
+                    let bytes = data.into_bytes();
+                    let filename = key.split('/').last().unwrap_or("download");
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header("Content-Type", content_type)
+                        .header("Content-Disposition", format!("attachment; filename=\"{}\"", filename))
+                        .body(Body::from(bytes))
+                        .unwrap()
+                        .into_response()
+                }
+                Err(e) => {
+                    eprintln!("bucket_object_download body error: {}", e);
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Error reading object").into_response()
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("bucket_object_download get error: {}", e);
+            (StatusCode::NOT_FOUND, "Object not found").into_response()
+        }
+    }
+}
+
+async fn bucket_object_edit_page(
+    AxumState(state): AxumState<AppState>,
+    Query(query): Query<BucketObjectQuery>,
+) -> impl IntoResponse {
+    let return_prefix = query.return_prefix.clone().unwrap_or_default();
+    let (bucket_cfg, retry_count, retry_delay_ms) = {
+        let config = state.read().unwrap();
+        match config.buckets.get(&query.name) {
+            Some(bc) => (bc.clone(), config.s3_retry_count, config.s3_retry_delay_ms),
+            None => {
+                return HtmlTemplate(BucketObjectEditTemplate {
+                    bucket_display: query.name,
+                    bucket_name: "-".to_string(),
+                    key: query.key,
+                    return_prefix,
+                    content: "".to_string(),
+                    size_bytes: None,
+                    error: Some("Bucket not found".to_string()),
+                    is_readonly: true,
+                })
+                .into_response()
+            }
+        }
+    };
+    let client = create_s3_client(&bucket_cfg).await;
+    let bucket_name = bucket_cfg.bucket_name.clone();
+    let key = query.key.clone();
+
+    let max_edit_bytes: usize = 512 * 1024;
+
+    let op_name = format!("bucket_object_edit: {}", key);
+    match retry_s3_operation(
+        &op_name,
+        retry_count,
+        retry_delay_ms,
+        || {
+            let client = client.clone();
+            let bucket = bucket_name.clone();
+            let key = key.clone();
+            async move { client.get_object().bucket(&bucket).key(&key).send().await }
+        },
+    )
+    .await
+    {
+        Ok(output) => match output.body.collect().await {
+            Ok(data) => {
+                let bytes = data.into_bytes();
+                if bytes.len() > max_edit_bytes {
+                    return HtmlTemplate(BucketObjectEditTemplate {
+                        bucket_display: query.name,
+                        bucket_name: bucket_cfg.bucket_name,
+                        key: query.key,
+                        return_prefix,
+                        content: "".to_string(),
+                        size_bytes: Some(bytes.len() as i64),
+                        error: Some(format!(
+                            "Object is too large to edit in browser ({} bytes). Please download it instead.",
+                            bytes.len()
+                        )),
+                        is_readonly: true,
+                    })
+                    .into_response();
+                }
+                match String::from_utf8(bytes.to_vec()) {
+                    Ok(content) => HtmlTemplate(BucketObjectEditTemplate {
+                        bucket_display: query.name,
+                        bucket_name: bucket_cfg.bucket_name,
+                        key: query.key,
+                        return_prefix,
+                        content,
+                        size_bytes: Some(bytes.len() as i64),
+                        error: None,
+                        is_readonly: false,
+                    })
+                    .into_response(),
+                    Err(_) => HtmlTemplate(BucketObjectEditTemplate {
+                        bucket_display: query.name,
+                        bucket_name: bucket_cfg.bucket_name,
+                        key: query.key,
+                        return_prefix,
+                        content: "".to_string(),
+                        size_bytes: Some(bytes.len() as i64),
+                        error: Some("Object is not valid UTF-8 text. Use Download instead.".to_string()),
+                        is_readonly: true,
+                    })
+                    .into_response(),
+                }
+            }
+            Err(e) => {
+                eprintln!("bucket_object_edit body error: {}", e);
+                HtmlTemplate(BucketObjectEditTemplate {
+                    bucket_display: query.name,
+                    bucket_name: bucket_cfg.bucket_name,
+                    key: query.key,
+                    return_prefix,
+                    content: "".to_string(),
+                    size_bytes: None,
+                    error: Some("Error reading object".to_string()),
+                    is_readonly: true,
+                })
+                .into_response()
+            }
+        },
+        Err(e) => {
+            eprintln!("bucket_object_edit get error: {}", e);
+            HtmlTemplate(BucketObjectEditTemplate {
+                bucket_display: query.name,
+                bucket_name: bucket_cfg.bucket_name,
+                key: query.key,
+                return_prefix,
+                content: "".to_string(),
+                size_bytes: None,
+                error: Some("Object not found".to_string()),
+                is_readonly: true,
+            })
+            .into_response()
+        }
+    }
+}
+
+async fn bucket_object_save(
+    AxumState(state): AxumState<AppState>,
+    Form(form): Form<BucketObjectSaveForm>,
+) -> impl IntoResponse {
+    let (bucket_cfg, retry_count, retry_delay_ms) = {
+        let config = state.read().unwrap();
+        match config.buckets.get(&form.name) {
+            Some(bc) => (bc.clone(), config.s3_retry_count, config.s3_retry_delay_ms),
+            None => return Redirect::to("/buckets?error=Bucket+not+found").into_response(),
+        }
+    };
+    let client = create_s3_client(&bucket_cfg).await;
+    let bucket_name = bucket_cfg.bucket_name.clone();
+    let key = form.key.clone();
+    let content_bytes = form.content.into_bytes();
+
+    let op_name = format!("bucket_object_save: {}", key);
+    let res = retry_s3_operation(
+        &op_name,
+        retry_count,
+        retry_delay_ms,
+        || {
+            let client = client.clone();
+            let bucket = bucket_name.clone();
+            let key = key.clone();
+            let content_bytes = content_bytes.clone();
+            async move {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .body(ByteStream::from(content_bytes))
+                    .send()
+                    .await
+            }
+        },
+    )
+    .await;
+
+    match res {
+        Ok(_) => Redirect::to(&format!(
+            "/buckets/manage?name={}&prefix={}",
+            form.name, form.return_prefix
+        ))
+        .into_response(),
+        Err(e) => {
+            eprintln!("bucket_object_save error: {}", e);
+            Redirect::to(&format!(
+                "/buckets/object/edit?name={}&key={}&return_prefix={}",
+                form.name, form.key, form.return_prefix
+            ))
+            .into_response()
+        }
+    }
+}
+
+async fn bucket_object_delete(
+    AxumState(state): AxumState<AppState>,
+    Form(form): Form<BucketObjectDeleteForm>,
+) -> impl IntoResponse {
+    let (bucket_cfg, retry_count, retry_delay_ms) = {
+        let config = state.read().unwrap();
+        match config.buckets.get(&form.name) {
+            Some(bc) => (bc.clone(), config.s3_retry_count, config.s3_retry_delay_ms),
+            None => return Redirect::to("/buckets?error=Bucket+not+found").into_response(),
+        }
+    };
+    let client = create_s3_client(&bucket_cfg).await;
+    let bucket_name = bucket_cfg.bucket_name.clone();
+    let key = form.key.clone();
+
+    let op_name = format!("bucket_object_delete: {}", key);
+    let _ = retry_s3_operation(
+        &op_name,
+        retry_count,
+        retry_delay_ms,
+        || {
+            let client = client.clone();
+            let bucket = bucket_name.clone();
+            let key = key.clone();
+            async move { client.delete_object().bucket(&bucket).key(&key).send().await }
+        },
+    )
+    .await;
+
+    Redirect::to(&format!(
+        "/buckets/manage?name={}&prefix={}",
+        form.name, form.return_prefix
+    ))
+    .into_response()
+}
+
+async fn bucket_object_upload(
+    AxumState(state): AxumState<AppState>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    let mut bucket_display = String::new();
+    let mut prefix = String::new();
+    let mut override_filename = String::new();
+    let mut file_name: Option<String> = None;
+    let mut file_data: Vec<u8> = Vec::new();
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("").to_string();
+        match name.as_str() {
+            "name" => bucket_display = field.text().await.unwrap_or_default(),
+            "prefix" => prefix = field.text().await.unwrap_or_default(),
+            "filename" => override_filename = field.text().await.unwrap_or_default(),
+            "file" => {
+                file_name = field.file_name().map(|s| s.to_string());
+                file_data = field.bytes().await.unwrap_or_default().to_vec();
+            }
+            _ => {}
+        }
+    }
+
+    let (bucket_cfg, retry_count, retry_delay_ms) = {
+        let config = state.read().unwrap();
+        match config.buckets.get(&bucket_display) {
+            Some(bc) => (bc.clone(), config.s3_retry_count, config.s3_retry_delay_ms),
+            None => return Redirect::to("/buckets?error=Bucket+not+found").into_response(),
+        }
+    };
+
+    let prefix = normalize_folder_prefix(prefix);
+    let final_name = normalize_opt_string(&override_filename)
+        .or(file_name)
+        .unwrap_or_else(|| "upload.bin".to_string());
+    let key = if prefix.is_empty() {
+        final_name
+    } else {
+        format!("{}{}", prefix, final_name)
+    };
+
+    let client = create_s3_client(&bucket_cfg).await;
+    let bucket_name = bucket_cfg.bucket_name.clone();
+    let file_data = file_data;
+
+    let op_name = format!("bucket_object_upload: {}", key);
+    let _ = retry_s3_operation(
+        &op_name,
+        retry_count,
+        retry_delay_ms,
+        || {
+            let client = client.clone();
+            let bucket = bucket_name.clone();
+            let key = key.clone();
+            let file_data = file_data.clone();
+            async move {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .body(ByteStream::from(file_data))
+                    .send()
+                    .await
+            }
+        },
+    )
+    .await;
+
+    Redirect::to(&format!(
+        "/buckets/manage?name={}&prefix={}",
+        bucket_display, prefix
+    ))
+    .into_response()
+}
+
 async fn manifests_page(AxumState(state): AxumState<AppState>) -> impl IntoResponse {
     let config = state.read().unwrap();
-    let manifests: Vec<_> = config.manifests.iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
+    let mut manifests: Vec<ManifestCard> = config
+        .manifests
+        .iter()
+        .map(|(name, m)| {
+            let folder_owner_default = m
+                .service_folder_owner
+                .clone()
+                .unwrap_or_else(|| m.service_owner.clone());
+            let folder_group_default = m
+                .service_folder_group
+                .clone()
+                .unwrap_or_else(|| m.service_group.clone());
+
+            let files = m
+                .files
+                .iter()
+                .map(|f| {
+                    let attrs_explicit = f.owner.is_some() || f.group.is_some() || f.mode.is_some();
+                    let eff_owner = f.owner.clone().unwrap_or_else(|| folder_owner_default.clone());
+                    let eff_group = f.group.clone().unwrap_or_else(|| folder_group_default.clone());
+                    let eff_mode = match normalize_mode_opt(f.mode.clone()) {
+                        Ok(Some(mm)) => mm,
+                        _ => default_override_mode(&f.path, &f.file_type).to_string(),
+                    };
+                    ManifestFileDisplay {
+                        path: f.path.clone(),
+                        file_type: f.file_type.to_string(),
+                        attrs: format!("{}:{}:{}", eff_owner, eff_group, eff_mode),
+                        attrs_explicit,
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            ManifestCard {
+                name: name.clone(),
+                profile: m.profile.to_string(),
+                resource_profile: m.resource_profile.clone(),
+                bucket: m.bucket.clone(),
+                files,
+            }
+        })
         .collect();
+    manifests.sort_by(|a, b| a.name.cmp(&b.name));
     let buckets: Vec<_> = config.buckets.iter()
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
@@ -1681,25 +2773,25 @@ async fn add_manifest(
         .into_response();
     }
 
-    let owners: Vec<Option<String>> = form.owners
+    let owners: Vec<Option<String>> = form
+        .owners
         .lines()
-        .map(|s| s.trim().to_string())
-        .map(|s| if s.is_empty() { None } else { Some(s) })
+        .map(|s| parse_dash_opt_string(s))
         .collect();
     
-    let groups: Vec<Option<String>> = form.groups
+    let groups: Vec<Option<String>> = form
+        .groups
         .lines()
-        .map(|s| s.trim().to_string())
-        .map(|s| if s.is_empty() { None } else { Some(s) })
+        .map(|s| parse_dash_opt_string(s))
         .collect();
     
-    let modes: Vec<Option<String>> = form.modes
+    let modes: Vec<Option<String>> = form
+        .modes
         .lines()
-        .map(|s| s.trim().to_string())
-        .map(|s| if s.is_empty() { None } else { Some(s) })
+        .map(|s| parse_dash_opt_string(s))
         .collect();
     
-    let files: Vec<ManifestFile> = file_paths.iter()
+    let mut files: Vec<ManifestFile> = file_paths.iter()
         .zip(file_types.iter())
         .enumerate()
         .map(|(i, (path, ftype))| ManifestFile {
@@ -1714,6 +2806,80 @@ async fn add_manifest(
             mode: modes.get(i).cloned().unwrap_or(None),
         })
         .collect();
+
+    // Validate optional per-file overrides.
+    for f in files.iter_mut() {
+        if let Err(e) = validate_optional_owner_group("file owner", &f.owner) {
+            return Html(format!(
+                r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p><strong>Invalid owner override</strong> for <code>{}</code>: {}</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+                f.path, e
+            ))
+            .into_response();
+        }
+        if let Err(e) = validate_optional_owner_group("file group", &f.group) {
+            return Html(format!(
+                r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p><strong>Invalid group override</strong> for <code>{}</code>: {}</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+                f.path, e
+            ))
+            .into_response();
+        }
+        // Normalize/validate optional mode (also handles "700" -> "0700").
+        match normalize_mode_opt(f.mode.clone()) {
+            Ok(n) => f.mode = n,
+            Err(e) => {
+                return Html(format!(
+                    r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p><strong>Invalid mode override</strong> for <code>{}</code>: {}</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+                    f.path, e
+                ))
+                .into_response();
+            }
+        }
+    }
     
     // Validate file paths (applies to all profiles)
     for file in &files {
@@ -2141,25 +3307,13 @@ async fn update_manifest(
         .into_response();
     }
     
-    let owners: Vec<Option<String>> = form.owners
-        .lines()
-        .map(|s| s.trim().to_string())
-        .map(|s| if s.is_empty() { None } else { Some(s) })
-        .collect();
+    let owners: Vec<Option<String>> = form.owners.lines().map(|s| parse_dash_opt_string(s)).collect();
     
-    let groups: Vec<Option<String>> = form.groups
-        .lines()
-        .map(|s| s.trim().to_string())
-        .map(|s| if s.is_empty() { None } else { Some(s) })
-        .collect();
+    let groups: Vec<Option<String>> = form.groups.lines().map(|s| parse_dash_opt_string(s)).collect();
     
-    let modes: Vec<Option<String>> = form.modes
-        .lines()
-        .map(|s| s.trim().to_string())
-        .map(|s| if s.is_empty() { None } else { Some(s) })
-        .collect();
+    let modes: Vec<Option<String>> = form.modes.lines().map(|s| parse_dash_opt_string(s)).collect();
     
-    let files: Vec<ManifestFile> = file_paths.iter()
+    let mut files: Vec<ManifestFile> = file_paths.iter()
         .zip(file_types.iter())
         .enumerate()
         .map(|(i, (path, ftype))| ManifestFile {
@@ -2174,6 +3328,79 @@ async fn update_manifest(
             mode: modes.get(i).cloned().unwrap_or(None),
         })
         .collect();
+
+    // Validate optional per-file overrides and normalize mode (e.g. 700 -> 0700).
+    for f in files.iter_mut() {
+        if let Err(e) = validate_optional_owner_group("file owner", &f.owner) {
+            return Html(format!(
+                r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests/edit?name={}">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p><strong>Invalid owner override</strong> for <code>{}</code>: {}</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests/edit?name={}">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+                form.original_name, f.path, e, form.original_name
+            ))
+            .into_response();
+        }
+        if let Err(e) = validate_optional_owner_group("file group", &f.group) {
+            return Html(format!(
+                r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests/edit?name={}">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p><strong>Invalid group override</strong> for <code>{}</code>: {}</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests/edit?name={}">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+                form.original_name, f.path, e, form.original_name
+            ))
+            .into_response();
+        }
+        match normalize_mode_opt(f.mode.clone()) {
+            Ok(n) => f.mode = n,
+            Err(e) => {
+                return Html(format!(
+                    r#"<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="refresh" content="5;url=/manifests/edit?name={}">
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container mt-5">
+        <div class="alert alert-danger">
+            <h4><i class="bi bi-exclamation-triangle"></i> Validation Failed</h4>
+            <p><strong>Invalid mode override</strong> for <code>{}</code>: {}</p>
+            <p class="mb-0">Redirecting back in 5 seconds... <a href="/manifests/edit?name={}">Click here</a> if not redirected.</p>
+        </div>
+    </div>
+</body>
+</html>"#,
+                    form.original_name, f.path, e, form.original_name
+                ))
+                .into_response();
+            }
+        }
+    }
     
     // Validate file paths (applies to all profiles)
     for file in &files {
@@ -4660,26 +5887,49 @@ async fn get_file_status(
     
     let client = create_s3_client(&bucket_config).await;
     
-    // Check if deployment is finalized and load snapshot if it is
-    let manifest_files = if is_deployment_finalized(&client, &bucket_name, &query.manifest, &query.version, &bucket_config, retry_count, retry_delay_ms).await {
-        // Load from manifest.json snapshot
-        match load_manifest_snapshot(&client, &bucket_name, &query.manifest, &query.version, &bucket_config, retry_count, retry_delay_ms).await {
-            Some(snapshot) => snapshot.files,
-            None => {
-                // Fallback to current manifest if snapshot can't be loaded
-                let config = state.read().unwrap();
-                config.manifests.get(&query.manifest)
-                    .map(|m| m.files.clone())
-                    .unwrap_or_default()
+    // Load manifest files + defaults for displaying attributes.
+    let (manifest_files, service_owner, service_group, service_folder_owner, service_folder_group) =
+        if is_deployment_finalized(&client, &bucket_name, &query.manifest, &query.version, &bucket_config, retry_count, retry_delay_ms).await {
+            match load_manifest_snapshot(&client, &bucket_name, &query.manifest, &query.version, &bucket_config, retry_count, retry_delay_ms).await {
+                Some(snapshot) => (
+                    snapshot.files,
+                    snapshot.service_owner,
+                    snapshot.service_group,
+                    snapshot.service_folder_owner,
+                    snapshot.service_folder_group,
+                ),
+                None => {
+                    let config = state.read().unwrap();
+                    if let Some(m) = config.manifests.get(&query.manifest) {
+                        (
+                            m.files.clone(),
+                            m.service_owner.clone(),
+                            m.service_group.clone(),
+                            m.service_folder_owner.clone(),
+                            m.service_folder_group.clone(),
+                        )
+                    } else {
+                        (Vec::new(), "root".to_string(), "root".to_string(), None, None)
+                    }
+                }
             }
-        }
-    } else {
-        // Use current manifest for draft versions
-        let config = state.read().unwrap();
-        config.manifests.get(&query.manifest)
-            .map(|m| m.files.clone())
-            .unwrap_or_default()
-    };
+        } else {
+            let config = state.read().unwrap();
+            if let Some(m) = config.manifests.get(&query.manifest) {
+                (
+                    m.files.clone(),
+                    m.service_owner.clone(),
+                    m.service_group.clone(),
+                    m.service_folder_owner.clone(),
+                    m.service_folder_group.clone(),
+                )
+            } else {
+                (Vec::new(), "root".to_string(), "root".to_string(), None, None)
+            }
+        };
+
+    let folder_owner_default = service_folder_owner.unwrap_or_else(|| service_owner);
+    let folder_group_default = service_folder_group.unwrap_or_else(|| service_group);
     let base_prefix = format!("deployments/{}/{}/", query.manifest, query.version);
     let prefix = bucket_config.full_key(&base_prefix);
     
@@ -4716,11 +5966,22 @@ async fn get_file_status(
     for file in manifest_files {
         let metadata = existing_files.get(&file.path);
         let exists = metadata.is_some();
+
+        let attrs_explicit = file.owner.is_some() || file.group.is_some() || file.mode.is_some();
+        let eff_owner = file.owner.clone().unwrap_or_else(|| folder_owner_default.clone());
+        let eff_group = file.group.clone().unwrap_or_else(|| folder_group_default.clone());
+        let eff_mode = match normalize_mode_opt(file.mode.clone()) {
+            Ok(Some(m)) => m,
+            _ => default_override_mode(&file.path, &file.file_type).to_string(),
+        };
+        let attrs = format!("{}:{}:{}", eff_owner, eff_group, eff_mode);
         
         if let Some((size, last_modified)) = metadata {
             file_statuses.push(json!({
                 "path": file.path,
                 "file_type": file.file_type.to_string(),
+                "attrs": attrs,
+                "attrs_explicit": attrs_explicit,
                 "exists": exists,
                 "size": size,
                 "last_modified": last_modified,
@@ -4729,6 +5990,8 @@ async fn get_file_status(
             file_statuses.push(json!({
                 "path": file.path,
                 "file_type": file.file_type.to_string(),
+                "attrs": attrs,
+                "attrs_explicit": attrs_explicit,
                 "exists": exists,
                 "size": null,
                 "last_modified": null,
@@ -6799,10 +8062,14 @@ struct OverrideFileInfo {
     last_modified: String,
     is_folder: bool,
     file_type: String,
-    owner_group: Option<String>,
+    owner: Option<String>,
+    group: Option<String>,
     mode: Option<String>,
-    owner_group_str: String,
+    owner_str: String,
+    group_str: String,
     mode_str: String,
+    has_custom_meta: bool,
+    meta_str: String,
 }
 
 // Load cell overrides manifest
@@ -6968,22 +8235,42 @@ async fn cell_overrides_page(
                         let is_folder = relative_path.ends_with('/');
                         
                         // Get metadata from manifest (customization is optional)
-                        let (file_type, owner_group, mode) = if let Some(meta) = metadata_map.get(&relative_path) {
-                            let og = match (meta.owner.as_deref(), meta.group.as_deref()) {
-                                (Some(o), Some(g)) if !o.trim().is_empty() && !g.trim().is_empty() => {
-                                    Some(format!("{}:{}", o.trim(), g.trim()))
-                                }
-                                _ => None,
-                            };
-                            let m = meta.mode.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string());
-                            (meta.file_type.to_string(), og, m)
+                        let (file_type, owner, group, mode) = if let Some(meta) = metadata_map.get(&relative_path) {
+                            let o = meta
+                                .owner
+                                .as_deref()
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.to_string());
+                            let g = meta
+                                .group
+                                .as_deref()
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.to_string());
+                            let m_raw = meta
+                                .mode
+                                .as_deref()
+                                .map(|s| s.trim())
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.to_string());
+                            let m = normalize_mode_opt(m_raw).unwrap_or(None);
+                            (meta.file_type.to_string(), o, g, m)
                         } else {
                             let ft = if is_folder { "folder" } else { "binary" };
-                            (ft.to_string(), None, None)
+                            (ft.to_string(), None, None, None)
                         };
                         
-                        let owner_group_str = owner_group.clone().unwrap_or_default();
+                        let owner_str = owner.clone().unwrap_or_default();
+                        let group_str = group.clone().unwrap_or_default();
                         let mode_str = mode.clone().unwrap_or_default();
+                        let has_custom_meta = owner.is_some() || group.is_some() || mode.is_some();
+                        let meta_str = format!(
+                            "{}:{}:{}",
+                            owner.clone().unwrap_or_else(|| "-".to_string()),
+                            group.clone().unwrap_or_else(|| "-".to_string()),
+                            mode.clone().unwrap_or_else(|| "-".to_string())
+                        );
                         overrides.push(OverrideFileInfo {
                             path: relative_path.clone(),
                             size: obj.size.unwrap_or(0),
@@ -6992,10 +8279,14 @@ async fn cell_overrides_page(
                                 .unwrap_or_default(),
                             is_folder,
                             file_type,
-                            owner_group,
+                            owner,
+                            group,
                             mode,
-                            owner_group_str,
+                            owner_str,
+                            group_str,
                             mode_str,
+                            has_custom_meta,
+                            meta_str,
                         });
                     }
                 }
@@ -7228,39 +8519,41 @@ async fn upload_cell_override(
         _ => FileType::Binary,
     };
 
-    // Normalize optional customization: either full (owner+group+mode) or empty.
-    let owner_t = owner.trim().to_string();
-    let group_t = group.trim().to_string();
-    let mode_t = mode.trim().to_string();
-    let has_any = !owner_t.is_empty() || !group_t.is_empty() || !mode_t.is_empty();
-    if has_any && (owner_t.is_empty() || group_t.is_empty() || mode_t.is_empty()) {
+    // Normalize optional customization. Each field can be independently defaulted using "-" (or left empty).
+    let owner_opt = parse_dash_opt_string(&owner);
+    let group_opt = parse_dash_opt_string(&group);
+    let mode_opt = match normalize_mode_opt(parse_dash_opt_string(&mode)) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Html(format!(
+                    "<html><head><meta http-equiv='refresh' content='5;url=/cells'></head><body>{}</body></html>",
+                    e
+                )),
+            )
+            .into_response();
+        }
+    };
+    if let Err(e) = validate_optional_owner_group("override owner", &owner_opt) {
         return (
             StatusCode::BAD_REQUEST,
-            Html("<html><head><meta http-equiv='refresh' content='5;url=/cells'></head><body>Customization must include owner + group + mode, or be fully empty.</body></html>".to_string()),
+            Html(format!(
+                "<html><head><meta http-equiv='refresh' content='5;url=/cells'></head><body>{}</body></html>",
+                e
+            )),
         )
-            .into_response();
+        .into_response();
     }
-    if has_any {
-        if let Err(e) = validate_service_identity(&owner_t, &group_t) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Html(format!(
-                    "<html><head><meta http-equiv='refresh' content='5;url=/cells'></head><body>{}</body></html>",
-                    e
-                )),
-            )
-                .into_response();
-        }
-        if let Err(e) = parse_mode_octal(&mode_t) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Html(format!(
-                    "<html><head><meta http-equiv='refresh' content='5;url=/cells'></head><body>{}</body></html>",
-                    e
-                )),
-            )
-                .into_response();
-        }
+    if let Err(e) = validate_optional_owner_group("override group", &group_opt) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html(format!(
+                "<html><head><meta http-equiv='refresh' content='5;url=/cells'></head><body>{}</body></html>",
+                e
+            )),
+        )
+        .into_response();
     }
     
     // Remove existing entry if present
@@ -7270,9 +8563,9 @@ async fn upload_cell_override(
     manifest.files.push(CellOverrideFile {
         path: normalized_file_path.clone(),
         file_type: ft,
-        owner: if has_any { Some(owner_t) } else { None },
-        group: if has_any { Some(group_t) } else { None },
-        mode: if has_any { Some(mode_t) } else { None },
+        owner: owner_opt,
+        group: group_opt,
+        mode: mode_opt,
     });
     
     // Save manifest
@@ -7526,55 +8819,57 @@ async fn update_cell_override_meta(
         _ => FileType::Binary,
     };
 
-    // Normalize optional customization: either full (owner+group+mode) or empty.
-    let owner_t = form.owner.trim().to_string();
-    let group_t = form.group.trim().to_string();
-    let mode_t = form.mode.trim().to_string();
-    let has_any = !owner_t.is_empty() || !group_t.is_empty() || !mode_t.is_empty();
-    if has_any && (owner_t.is_empty() || group_t.is_empty() || mode_t.is_empty()) {
+    // Normalize optional customization. Each field can be independently defaulted using "-" (or left empty).
+    let owner_opt = parse_dash_opt_string(&form.owner);
+    let group_opt = parse_dash_opt_string(&form.group);
+    let mode_opt = match normalize_mode_opt(parse_dash_opt_string(&form.mode)) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Html(format!(
+                    "<html><head><meta http-equiv='refresh' content='5;url=/cells'></head><body>{}</body></html>",
+                    e
+                )),
+            )
+            .into_response();
+        }
+    };
+    if let Err(e) = validate_optional_owner_group("override owner", &owner_opt) {
         return (
             StatusCode::BAD_REQUEST,
-            Html("<html><head><meta http-equiv='refresh' content='5;url=/cells'></head><body>Customization must include owner + group + mode, or be fully empty.</body></html>".to_string()),
+            Html(format!(
+                "<html><head><meta http-equiv='refresh' content='5;url=/cells'></head><body>{}</body></html>",
+                e
+            )),
         )
-            .into_response();
+        .into_response();
     }
-    if has_any {
-        if let Err(e) = validate_service_identity(&owner_t, &group_t) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Html(format!(
-                    "<html><head><meta http-equiv='refresh' content='5;url=/cells'></head><body>{}</body></html>",
-                    e
-                )),
-            )
-                .into_response();
-        }
-        if let Err(e) = parse_mode_octal(&mode_t) {
-            return (
-                StatusCode::BAD_REQUEST,
-                Html(format!(
-                    "<html><head><meta http-equiv='refresh' content='5;url=/cells'></head><body>{}</body></html>",
-                    e
-                )),
-            )
-                .into_response();
-        }
+    if let Err(e) = validate_optional_owner_group("override group", &group_opt) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Html(format!(
+                "<html><head><meta http-equiv='refresh' content='5;url=/cells'></head><body>{}</body></html>",
+                e
+            )),
+        )
+        .into_response();
     }
     
     // Find and update existing entry, or add new one
     if let Some(existing) = manifest.files.iter_mut().find(|f| f.path == form.file_path) {
         existing.file_type = ft;
-        existing.owner = if has_any { Some(owner_t) } else { None };
-        existing.group = if has_any { Some(group_t) } else { None };
-        existing.mode = if has_any { Some(mode_t) } else { None };
+        existing.owner = owner_opt.clone();
+        existing.group = group_opt.clone();
+        existing.mode = mode_opt.clone();
     } else {
         // File not in manifest yet (legacy file), add it
         manifest.files.push(CellOverrideFile {
             path: form.file_path.clone(),
             file_type: ft,
-            owner: if has_any { Some(owner_t) } else { None },
-            group: if has_any { Some(group_t) } else { None },
-            mode: if has_any { Some(mode_t) } else { None },
+            owner: owner_opt,
+            group: group_opt,
+            mode: mode_opt,
         });
     }
     
@@ -7599,6 +8894,27 @@ struct CellVersionsTemplate {
 struct CellVersionInfo {
     version: String,
     published_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct CellVersionFileRow {
+    path: String,
+    file_type: String, // "folder" | "text" | "binary" | "unknown"
+    attrs: String,     // user:group:mode
+    etag: String,
+    size: Option<i64>,
+    last_modified: String,
+}
+
+#[derive(Template)]
+#[template(path = "cell_version_view.html")]
+struct CellVersionViewTemplate {
+    node_id: String,
+    cell_id: String,
+    bucket: String,
+    version: String,
+    files: Vec<CellVersionFileRow>,
+    error: Option<String>,
 }
 
 async fn cell_versions_page(
@@ -7771,6 +9087,235 @@ async fn delete_cell_version(
     }
     
     Redirect::to(&format!("/cells/{}/{}/versions", node_id, cell_id)).into_response()
+}
+
+async fn cell_version_view_page(
+    AxumState(state): AxumState<AppState>,
+    AxumPath((node_id, cell_id, version)): AxumPath<(String, String, String)>,
+) -> impl IntoResponse {
+    // Clone config data before await
+    let (bucket_name, bucket_config, retry_count, retry_delay_ms) = {
+        let config = state.read().unwrap();
+        let cell_key = format!("{}/{}", node_id, cell_id);
+        match config.cells.get(&cell_key) {
+            Some(cell) => match config.buckets.get(&cell.bucket) {
+                Some(bc) => (bc.bucket_name.clone(), bc.clone(), config.s3_retry_count, config.s3_retry_delay_ms),
+                None => {
+                    return HtmlTemplate(CellVersionViewTemplate {
+                        node_id,
+                        cell_id,
+                        bucket: "-".to_string(),
+                        version,
+                        files: vec![],
+                        error: Some("Bucket not found".to_string()),
+                    })
+                    .into_response()
+                }
+            },
+            None => {
+                return HtmlTemplate(CellVersionViewTemplate {
+                    node_id,
+                    cell_id,
+                    bucket: "-".to_string(),
+                    version,
+                    files: vec![],
+                    error: Some("Cell not found".to_string()),
+                })
+                .into_response()
+            }
+        }
+    };
+
+    let client = create_s3_client(&bucket_config).await;
+    let version_prefix_base = format!("cells/{}/{}/versions/{}/", node_id, cell_id, version);
+    let version_prefix = bucket_config.full_key(&version_prefix_base);
+
+    // Load cell version manifest snapshot.
+    let manifest_snapshot: Option<controller_config::ManifestSnapshot> = {
+        let key_base = format!("{}manifest.json", version_prefix_base);
+        let key = bucket_config.full_key(&key_base);
+        let op = format!("cell_version_view:get_manifest: {}", key);
+        let res = retry_s3_operation(&op, retry_count, retry_delay_ms, || {
+            let client = client.clone();
+            let bucket = bucket_name.clone();
+            let key = key.clone();
+            async move { client.get_object().bucket(&bucket).key(&key).send().await }
+        })
+        .await;
+        match res {
+            Ok(out) => match out.body.collect().await {
+                Ok(data) => serde_json::from_slice::<controller_config::ManifestSnapshot>(&data.into_bytes()).ok(),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        }
+    };
+
+    // Load resolved overrides manifest snapshot if present.
+    let overrides_snapshot: Option<ResolvedCellOverridesManifest> = {
+        let key_base = format!("{}overrides_manifest.json", version_prefix_base);
+        let key = bucket_config.full_key(&key_base);
+        let op = format!("cell_version_view:get_overrides_manifest: {}", key);
+        let res = retry_s3_operation(&op, retry_count, retry_delay_ms, || {
+            let client = client.clone();
+            let bucket = bucket_name.clone();
+            let key = key.clone();
+            async move { client.get_object().bucket(&bucket).key(&key).send().await }
+        })
+        .await;
+        match res {
+            Ok(out) => match out.body.collect().await {
+                Ok(data) => serde_json::from_slice::<ResolvedCellOverridesManifest>(&data.into_bytes()).ok(),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        }
+    };
+
+    // List objects under this version prefix (for size/etag/mtime).
+    let mut obj_meta: HashMap<String, (Option<String>, i64, String)> = HashMap::new(); // rel -> (etag, size, last_modified)
+    let mut token: Option<String> = None;
+    loop {
+        let op = format!("cell_version_view:list:{}", version_prefix);
+        let res = retry_s3_operation(&op, retry_count, retry_delay_ms, || {
+            let client = client.clone();
+            let bucket = bucket_name.clone();
+            let prefix = version_prefix.clone();
+            let token = token.clone();
+            async move {
+                let mut req = client.list_objects_v2().bucket(&bucket).prefix(&prefix);
+                if let Some(t) = token {
+                    req = req.continuation_token(t);
+                }
+                req.send().await
+            }
+        })
+        .await;
+
+        let out = match res {
+            Ok(o) => o,
+            Err(e) => {
+                return HtmlTemplate(CellVersionViewTemplate {
+                    node_id,
+                    cell_id,
+                    bucket: bucket_name,
+                    version,
+                    files: vec![],
+                    error: Some(format!("Failed to list version objects: {}", e)),
+                })
+                .into_response()
+            }
+        };
+
+        for obj in out.contents.unwrap_or_default() {
+            let Some(key) = obj.key.as_deref() else { continue };
+            let rel = if let Some(stripped) = bucket_config.strip_prefix(key) {
+                stripped.strip_prefix(&version_prefix_base).unwrap_or(stripped).to_string()
+            } else {
+                key.strip_prefix(&version_prefix).unwrap_or(key).to_string()
+            };
+            if rel.is_empty() {
+                continue;
+            }
+            // Hide internal snapshot files.
+            if rel == "manifest.json" || rel == "overrides_manifest.json" || rel == "trigger.json" || rel == "status.json" {
+                continue;
+            }
+            let etag = obj.e_tag().map(|s| s.trim_matches('"').to_string());
+            let size = obj.size.unwrap_or(0);
+            let last_modified = obj
+                .last_modified
+                .map(|dt| dt.fmt(aws_smithy_types::date_time::Format::DateTime).unwrap_or_default())
+                .unwrap_or_default();
+            obj_meta.insert(rel, (etag, size, last_modified));
+        }
+
+        if out.is_truncated.unwrap_or(false) {
+            token = out.next_continuation_token;
+        } else {
+            break;
+        }
+    }
+
+    // Build effective attrs map (merged: deployment snapshot, then overrides snapshot).
+    let mut attrs_map: HashMap<String, (String, String)> = HashMap::new(); // path -> (file_type, attrs)
+    if let Some(ms) = manifest_snapshot {
+        let folder_owner_default = ms.service_folder_owner.unwrap_or_else(|| ms.service_owner);
+        let folder_group_default = ms.service_folder_group.unwrap_or_else(|| ms.service_group);
+        for f in ms.files {
+            let owner = f.owner.unwrap_or_else(|| folder_owner_default.clone());
+            let group = f.group.unwrap_or_else(|| folder_group_default.clone());
+            let mode = match normalize_mode_opt(f.mode) {
+                Ok(Some(m)) => m,
+                _ => default_override_mode(&f.path, &f.file_type).to_string(),
+            };
+            attrs_map.insert(f.path.clone(), (f.file_type.to_string(), format!("{}:{}:{}", owner, group, mode)));
+        }
+    }
+    if let Some(os) = overrides_snapshot {
+        for of in os.files {
+            attrs_map.insert(
+                of.path.clone(),
+                (of.file_type.to_string(), format!("{}:{}:{}", of.owner, of.group, of.mode)),
+            );
+        }
+    }
+
+    // Union: show all objects we have (with meta), plus any manifest/override paths that are missing as objects.
+    let mut all_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for k in obj_meta.keys() {
+        all_paths.insert(k.clone());
+    }
+    for k in attrs_map.keys() {
+        all_paths.insert(k.clone());
+    }
+
+    let mut rows: Vec<CellVersionFileRow> = Vec::new();
+    for p in all_paths {
+        // Hide internal snapshot files again (defensive)
+        if p == "manifest.json" || p == "overrides_manifest.json" || p == "trigger.json" || p == "status.json" {
+            continue;
+        }
+        let (file_type, attrs) = attrs_map
+            .get(&p)
+            .cloned()
+            .unwrap_or_else(|| ("unknown".to_string(), "-:-:-".to_string()));
+
+        let (etag, size, last_modified) = match obj_meta.get(&p) {
+            Some((etag, sz, lm)) => (
+                etag.clone().unwrap_or_else(|| "".to_string()),
+                Some(*sz),
+                lm.clone(),
+            ),
+            None => ("".to_string(), None, "".to_string()),
+        };
+
+        let is_folder = p.ends_with('/') || file_type == "folder";
+        rows.push(CellVersionFileRow {
+            path: p,
+            file_type: if is_folder { "folder".to_string() } else { file_type },
+            attrs,
+            etag,
+            size: if is_folder { None } else { size },
+            last_modified,
+        });
+    }
+
+    rows.sort_by(|a, b| {
+        let af = a.file_type == "folder";
+        let bf = b.file_type == "folder";
+        af.cmp(&bf).reverse().then_with(|| a.path.cmp(&b.path))
+    });
+
+    HtmlTemplate(CellVersionViewTemplate {
+        node_id,
+        cell_id,
+        bucket: bucket_name,
+        version,
+        files: rows,
+        error: None,
+    })
+    .into_response()
 }
 
 // ========== Publish Deployment to Cell ==========
