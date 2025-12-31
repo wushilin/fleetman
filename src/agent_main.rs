@@ -61,6 +61,47 @@ fn apply_fleetagent_tokens_in_file(file_path: &Path, cell_id: &str, working_dir_
     Ok(())
 }
 
+fn apply_fleetagent_tokens_in_file_optional(file_path: &Path, cell_id: &str, working_dir_abs: &str) -> Result<()> {
+    if !file_path.exists() {
+        // Optional template files might not exist on some deployments.
+        return Ok(());
+    }
+    apply_fleetagent_tokens_in_file(file_path, cell_id, working_dir_abs)
+}
+
+fn apply_templates_from_manifest(target_dir: &Path, cell_id: &str, working_dir_abs: &str, manifest: &ManifestSnapshot) -> Result<()> {
+    for f in &manifest.files {
+        if f.file_type.to_lowercase() != "template" {
+            continue;
+        }
+        // Template files are editable text files rendered by FleetAgent at deploy time.
+        // Apply fleetagent_* tokens before ownership/permissions are applied.
+        let p = target_dir.join(&f.path);
+        apply_fleetagent_tokens_in_file_optional(&p, cell_id, working_dir_abs)?;
+    }
+    Ok(())
+}
+
+fn apply_templates_from_overrides_manifest(service_dir: &Path, cell_id: &str, working_dir_abs: &str) -> Result<()> {
+    let manifest_path = service_dir.join("overrides_manifest.json");
+    if !manifest_path.exists() {
+        return Ok(());
+    }
+    let content = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("Failed to read overrides manifest at {:?}", manifest_path))?;
+    let manifest: CellOverridesManifest = serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse overrides manifest at {:?}", manifest_path))?;
+
+    for f in &manifest.files {
+        if f.file_type.to_lowercase() != "template" {
+            continue;
+        }
+        let p = service_dir.join(&f.path);
+        apply_fleetagent_tokens_in_file_optional(&p, cell_id, working_dir_abs)?;
+    }
+    Ok(())
+}
+
 fn apply_service_identity_in_file(file_path: &Path, service_user: &str, service_group: &str) -> Result<()> {
     if !file_path.exists() {
         anyhow::bail!("Required file not found: {}", file_path.display());
@@ -948,7 +989,7 @@ fn default_max_log_lines() -> usize {
 #[derive(Debug, Deserialize, Clone)]
 struct ManifestFile {
     path: String,
-    file_type: String,  // "binary", "text", or "folder"
+    file_type: String,  // "binary", "text", "template", or "folder"
     owner: Option<String>,
     group: Option<String>,
     mode: Option<String>,
@@ -1365,6 +1406,24 @@ async fn deploy_with_systemd(
     download_version_files(config, s3_client, cell_info, version, &service_dir, manifest).await
         .with_context(|| format!("Failed to download version {} files to {}", version, service_dir))?;
 
+    // Apply fleetagent_* template tokens before ownership/permissions.
+    let working_dir_abs = match fs::canonicalize(&service_dir) {
+        Ok(p) => p.to_string_lossy().to_string(),
+        Err(_) => service_dir.clone(),
+    };
+    let service_dir_path = PathBuf::from(&service_dir);
+    apply_templates_from_manifest(&service_dir_path, &cell_info.cell_id, &working_dir_abs, manifest)?;
+    apply_templates_from_overrides_manifest(&service_dir_path, &cell_info.cell_id, &working_dir_abs)?;
+    // These are commonly needed even when run.sh/app.service are plain text (not type=template).
+    apply_fleetagent_tokens_in_file(&PathBuf::from(&service_dir).join("run.sh"), &cell_info.cell_id, &working_dir_abs)?;
+    apply_fleetagent_tokens_in_file(&PathBuf::from(&service_dir).join("app.service"), &cell_info.cell_id, &working_dir_abs)?;
+    // Ensure run-as identity converges to manifest on every deploy (even if app.service was edited).
+    apply_service_identity_in_file(
+        &PathBuf::from(&service_dir).join("app.service"),
+        &manifest.service_owner,
+        &manifest.service_group,
+    )?;
+
     // Re-apply ownership/permissions on every redeploy.
     let service_dir_path = PathBuf::from(&service_dir);
     let (svc_folder_owner, svc_folder_group) = resolve_service_folder_owner_group(manifest);
@@ -1380,24 +1439,6 @@ async fn deploy_with_systemd(
     // Overrides are snapshotted & merged into versions/<ver>/ at publish time.
     // Apply override permissions from overrides_manifest.json if present in the deployed folder.
     apply_overrides_manifest_in_place(&service_dir, &manifest.service_owner, &manifest.service_group)?;
-
-    // Apply fleetagent_* tokens into user-provided files before installing the unit.
-    // Fleetman cannot know the absolute service dir on the agent; FleetAgent fills:
-    // - fleetagent_cell_id -> cell id
-    // - fleetagent_service_working_dir -> absolute path of the service dir
-    // - fleetagent_base_dir -> agent process current working directory (absolute)
-    let working_dir_abs = match fs::canonicalize(&service_dir) {
-        Ok(p) => p.to_string_lossy().to_string(),
-        Err(_) => service_dir.clone(),
-    };
-    apply_fleetagent_tokens_in_file(&PathBuf::from(&service_dir).join("run.sh"), &cell_info.cell_id, &working_dir_abs)?;
-    apply_fleetagent_tokens_in_file(&PathBuf::from(&service_dir).join("app.service"), &cell_info.cell_id, &working_dir_abs)?;
-    // Ensure run-as identity converges to manifest on every deploy (even if app.service was edited).
-    apply_service_identity_in_file(
-        &PathBuf::from(&service_dir).join("app.service"),
-        &manifest.service_owner,
-        &manifest.service_group,
-    )?;
 
     // Ensure run.sh is executable if present.
     let run_sh = PathBuf::from(&service_dir).join("run.sh");
@@ -1950,6 +1991,7 @@ async fn deploy_with_processmaster(
     let app_name = format!("fleetman-{}", &cell_info.cell_id);
     // ProcessMaster auto-services require folder name == application name.
     let service_dir = auto_root.join(&app_name);
+    let pm_provisioned_marker = service_dir.join(".pm_provisioned");
 
     // Stop first to avoid "text file busy" when updating run.sh / binaries.
     // This must be best-effort for first deployments where the app may not exist yet.
@@ -1980,25 +2022,6 @@ async fn deploy_with_processmaster(
         )
     })?;
 
-    // Re-apply ownership/permissions on every redeploy.
-    let (svc_folder_owner, svc_folder_group) = resolve_service_folder_owner_group(manifest);
-    info!(
-        "   Reapplying service folder ownership recursively: {}:{}: {}",
-        svc_folder_owner,
-        svc_folder_group,
-        service_dir.display()
-    );
-    chown_recursive(&service_dir, &svc_folder_owner, &svc_folder_group)?;
-    reapply_manifest_permissions(&service_dir, manifest)?;
-
-    // Overrides are snapshotted & merged into versions/<ver>/ at publish time.
-    // Apply override permissions from overrides_manifest.json if present in the deployed folder.
-    apply_overrides_manifest_in_place(
-        service_dir.to_string_lossy().as_ref(),
-        &manifest.service_owner,
-        &manifest.service_group,
-    )?;
-
     // Apply fleetagent_* tokens for processmaster profile.
     // - fleetagent_cell_id -> cell id
     // - fleetagent_service_working_dir -> absolute path of the service dir
@@ -2017,11 +2040,32 @@ async fn deploy_with_processmaster(
             }
         }
     };
+    apply_templates_from_manifest(&service_dir, &cell_info.cell_id, &working_dir_abs, manifest)?;
+    apply_templates_from_overrides_manifest(&service_dir, &cell_info.cell_id, &working_dir_abs)?;
     apply_fleetagent_tokens_in_file(&service_dir.join("run.sh"), &cell_info.cell_id, &working_dir_abs)?;
     apply_fleetagent_tokens_in_file(&service_dir.join("service.yml"), &cell_info.cell_id, &working_dir_abs)?;
     // Ensure run-as identity converges to manifest on every deploy (even if service.yml was edited).
     apply_service_identity_in_file(
         &service_dir.join("service.yml"),
+        &manifest.service_owner,
+        &manifest.service_group,
+    )?;
+
+    // Re-apply ownership/permissions on every redeploy (after templating).
+    let (svc_folder_owner, svc_folder_group) = resolve_service_folder_owner_group(manifest);
+    info!(
+        "   Reapplying service folder ownership recursively: {}:{}: {}",
+        svc_folder_owner,
+        svc_folder_group,
+        service_dir.display()
+    );
+    chown_recursive(&service_dir, &svc_folder_owner, &svc_folder_group)?;
+    reapply_manifest_permissions(&service_dir, manifest)?;
+
+    // Overrides are snapshotted & merged into versions/<ver>/ at publish time.
+    // Apply override permissions from overrides_manifest.json if present in the deployed folder.
+    apply_overrides_manifest_in_place(
+        service_dir.to_string_lossy().as_ref(),
         &manifest.service_owner,
         &manifest.service_group,
     )?;
@@ -2032,6 +2076,22 @@ async fn deploy_with_processmaster(
         let mut perms = fs::metadata(&run_sh)?.permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&run_sh, perms)?;
+    }
+
+    // Force ProcessMaster to re-provision (e.g. to re-apply capabilities like net_bind_service)
+    // by removing the marker that indicates the service folder has already been provisioned.
+    if pm_provisioned_marker.exists() {
+        info!(
+            "   Removing ProcessMaster provision marker to force reprovision: {}",
+            pm_provisioned_marker.display()
+        );
+        if let Err(e) = fs::remove_file(&pm_provisioned_marker) {
+            warn!(
+                "Failed to remove {:?} (continuing): {}",
+                pm_provisioned_marker,
+                e
+            );
+        }
     }
 
     // pmctl update + start
@@ -2090,6 +2150,16 @@ async fn deploy_with_simple(
     info!("1️⃣ Deploying files to {}", target_dir);
     download_version_files(config, s3_client, cell_info, version, &target_dir, manifest).await
         .with_context(|| format!("Failed to download version {} files to {}", version, target_dir))?;
+
+    // Apply fleetagent_* tokens for any template files (and run.sh if present) before permissions.
+    let working_dir_abs = match fs::canonicalize(&target_dir) {
+        Ok(p) => p.to_string_lossy().to_string(),
+        Err(_) => target_dir.clone(),
+    };
+    let target_dir_path = PathBuf::from(&target_dir);
+    apply_templates_from_manifest(&target_dir_path, &cell_info.cell_id, &working_dir_abs, manifest)?;
+    apply_templates_from_overrides_manifest(&target_dir_path, &cell_info.cell_id, &working_dir_abs)?;
+    apply_fleetagent_tokens_in_file_optional(&PathBuf::from(&target_dir).join("run.sh"), &cell_info.cell_id, &working_dir_abs)?;
 
     // Overrides are snapshotted & merged into versions/<ver>/ at publish time.
     // Apply override permissions from overrides_manifest.json if present in the deployed folder.
@@ -2300,6 +2370,7 @@ async fn rollback_processmaster(
 
     let app_name = format!("fleetman-{}", &cell_info.cell_id);
     let service_dir = PathBuf::from(&pm.auto_services_root).join(&app_name);
+    let pm_provisioned_marker = service_dir.join(".pm_provisioned");
 
     // Stop first to avoid "text file busy" when updating run.sh / binaries.
     // Best-effort for missing services.
@@ -2349,21 +2420,6 @@ async fn rollback_processmaster(
         &manifest,
     )
     .await?;
-    // Re-apply ownership/permissions on rollback as well.
-    let (svc_folder_owner, svc_folder_group) = resolve_service_folder_owner_group(&manifest);
-    info!(
-        "🔙 Rollback: reapplying service folder ownership recursively: {}:{}: {}",
-        svc_folder_owner,
-        svc_folder_group,
-        service_dir.display()
-    );
-    chown_recursive(&service_dir, &svc_folder_owner, &svc_folder_group)?;
-    reapply_manifest_permissions(&service_dir, &manifest)?;
-    apply_overrides_manifest_in_place(
-        service_dir.to_string_lossy().as_ref(),
-        &manifest.service_owner,
-        &manifest.service_group,
-    )?;
 
     // Apply fleetagent_* tokens for processmaster profile.
     let working_dir_abs = match fs::canonicalize(&service_dir) {
@@ -2380,10 +2436,28 @@ async fn rollback_processmaster(
             }
         }
     };
+    apply_templates_from_manifest(&service_dir, &cell_info.cell_id, &working_dir_abs, &manifest)?;
+    apply_templates_from_overrides_manifest(&service_dir, &cell_info.cell_id, &working_dir_abs)?;
     apply_fleetagent_tokens_in_file(&service_dir.join("run.sh"), &cell_info.cell_id, &working_dir_abs)?;
     apply_fleetagent_tokens_in_file(&service_dir.join("service.yml"), &cell_info.cell_id, &working_dir_abs)?;
     apply_service_identity_in_file(
         &service_dir.join("service.yml"),
+        &manifest.service_owner,
+        &manifest.service_group,
+    )?;
+
+    // Re-apply ownership/permissions on rollback as well (after templating).
+    let (svc_folder_owner, svc_folder_group) = resolve_service_folder_owner_group(&manifest);
+    info!(
+        "🔙 Rollback: reapplying service folder ownership recursively: {}:{}: {}",
+        svc_folder_owner,
+        svc_folder_group,
+        service_dir.display()
+    );
+    chown_recursive(&service_dir, &svc_folder_owner, &svc_folder_group)?;
+    reapply_manifest_permissions(&service_dir, &manifest)?;
+    apply_overrides_manifest_in_place(
+        service_dir.to_string_lossy().as_ref(),
         &manifest.service_owner,
         &manifest.service_group,
     )?;
@@ -2393,6 +2467,21 @@ async fn rollback_processmaster(
         let mut perms = fs::metadata(&run_sh)?.permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&run_sh, perms)?;
+    }
+
+    // Same as deploy: remove provision marker to force ProcessMaster to re-provision.
+    if pm_provisioned_marker.exists() {
+        info!(
+            "🔙 Rollback: removing ProcessMaster provision marker to force reprovision: {}",
+            pm_provisioned_marker.display()
+        );
+        if let Err(e) = fs::remove_file(&pm_provisioned_marker) {
+            warn!(
+                "Failed to remove {:?} (continuing): {}",
+                pm_provisioned_marker,
+                e
+            );
+        }
     }
 
     info!("🔙 Rollback: pmctl update");
@@ -2473,8 +2562,23 @@ async fn rollback_systemd(
     // Download files
     download_version_files(config, s3_client, cell_info, rollback_version, &service_dir, &manifest).await?;
     
-    // Re-apply ownership/permissions on rollback as well.
+    // Apply fleetagent_* template tokens before ownership/permissions.
     let service_dir_path = PathBuf::from(&service_dir);
+    let working_dir_abs = match fs::canonicalize(&service_dir) {
+        Ok(p) => p.to_string_lossy().to_string(),
+        Err(_) => service_dir.clone(),
+    };
+    apply_templates_from_manifest(&service_dir_path, &cell_info.cell_id, &working_dir_abs, &manifest)?;
+    apply_templates_from_overrides_manifest(&service_dir_path, &cell_info.cell_id, &working_dir_abs)?;
+    apply_fleetagent_tokens_in_file(&PathBuf::from(&service_dir).join("run.sh"), &cell_info.cell_id, &working_dir_abs)?;
+    apply_fleetagent_tokens_in_file(&PathBuf::from(&service_dir).join("app.service"), &cell_info.cell_id, &working_dir_abs)?;
+    apply_service_identity_in_file(
+        &PathBuf::from(&service_dir).join("app.service"),
+        &manifest.service_owner,
+        &manifest.service_group,
+    )?;
+
+    // Re-apply ownership/permissions on rollback as well.
     let (svc_folder_owner, svc_folder_group) = resolve_service_folder_owner_group(&manifest);
     info!(
         "🔙 Rollback: reapplying service folder ownership recursively: {}:{}: {}",
@@ -2487,19 +2591,6 @@ async fn rollback_systemd(
 
     // Overrides are snapshotted & merged into versions/<ver>/ at publish time.
     apply_overrides_manifest_in_place(&service_dir, &manifest.service_owner, &manifest.service_group)?;
-
-    // Apply fleetagent_* tokens into user-provided files before installing the unit.
-    let working_dir_abs = match fs::canonicalize(&service_dir) {
-        Ok(p) => p.to_string_lossy().to_string(),
-        Err(_) => service_dir.clone(),
-    };
-    apply_fleetagent_tokens_in_file(&PathBuf::from(&service_dir).join("run.sh"), &cell_info.cell_id, &working_dir_abs)?;
-    apply_fleetagent_tokens_in_file(&PathBuf::from(&service_dir).join("app.service"), &cell_info.cell_id, &working_dir_abs)?;
-    apply_service_identity_in_file(
-        &PathBuf::from(&service_dir).join("app.service"),
-        &manifest.service_owner,
-        &manifest.service_group,
-    )?;
 
     // Ensure run.sh is executable if present.
     let run_sh = PathBuf::from(&service_dir).join("run.sh");

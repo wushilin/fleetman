@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+
+{% block title %}Login - Fleetman{% endblock %}
+
+{% block sidebar %}{% endblock %}
+{% block main_class %}col-12 px-3 py-4{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-5 col-lg-4">
+        <div class="card">
+            <div class="card-header">
+                <h5 class="mb-0 d-flex align-items-center gap-2">
+                    <img src="/static/android-chrome-512x512.png" alt="Fleetman" width="28" height="28" style="border-radius: 6px;">
+                    <span>Login</span>
+                </h5>
+            </div>
+            <div class="card-body">
+                {% if error.is_some() %}
+                <div class="alert alert-danger">
+                    <i class="bi bi-exclamation-triangle"></i> {{ error.as_ref().unwrap() }}
+                </div>
+                {% endif %}
+                <form method="post" action="/login">
+                    <input type="hidden" name="next" value="{{ next }}">
+                    <div class="mb-3">
+                        <label class="form-label">Username</label>
+                        <input type="text" class="form-control" id="usernameInput" name="username" autofocus required>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Password</label>
+                        <input type="password" class="form-control" name="password" required>
+                    </div>
+                    <div class="mb-3 form-check">
+                        <input type="checkbox" class="form-check-input" id="rememberMe">
+                        <label class="form-check-label" for="rememberMe">Remember me</label>
+                    </div>
+                    <button type="submit" class="btn btn-primary w-100">
+                        Sign in
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+<script>
+(function() {
+    const key = 'fleetman_remembered_username';
+    const input = document.getElementById('usernameInput');
+    const cb = document.getElementById('rememberMe');
+    try {
+        const saved = localStorage.getItem(key) || '';
+        if (saved && input && !input.value) {
+            input.value = saved;
+            if (cb) cb.checked = true;
+        }
+    } catch (_) {}
+
+    const form = input?.closest('form');
+    if (form) {
+        form.addEventListener('submit', function() {
+            try {
+                if (cb && cb.checked) {
+                    localStorage.setItem(key, (input?.value || '').trim());
+                } else {
+                    localStorage.removeItem(key);
+                }
+            } catch (_) {}
+        });
+    }
+})();
+</script>
+{% endblock %}
+
+

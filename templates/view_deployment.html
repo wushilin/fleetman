@@ -151,7 +151,8 @@
                     html += `<td><code>${file.path}</code></td>`;
                     
                     // File type badge with different color for folders
-                    const typeColor = file.file_type === 'text' ? 'info' : (file.file_type === 'folder' ? 'warning' : 'secondary');
+                    const isEditable = (file.file_type === 'text' || file.file_type === 'template');
+                    const typeColor = isEditable ? 'info' : (file.file_type === 'folder' ? 'warning' : 'secondary');
                     html += `<td><span class="badge bg-${typeColor}">${file.file_type}</span></td>`;
 
                     // Attrs (user:group:mode), with inherited vs explicit styling
@@ -175,8 +176,8 @@
                         
                         {% if !is_finalized %}
                         if (file.exists) {
-                            // Show edit button only for text files
-                            if (file.file_type === 'text') {
+                            // Show edit button only for editable text/template files
+                            if (isEditable) {
                                 html += `<a href="/deployments/edit?manifest=${manifestName}&version=${versionName}&file_path=${encodeURIComponent(file.path)}&edit=true" 
                                            class="btn btn-sm btn-primary me-1"><i class="bi bi-pencil"></i> Edit</a>`;
                             }
@@ -201,7 +202,7 @@
                                      </button>`;
 
                             // Generate templates (run.sh + service files)
-                            if (file.file_type === 'text' && (file.path === 'run.sh' || (serviceTemplateInfo && file.path === serviceTemplateInfo.target_path))) {
+                            if (isEditable && (file.path === 'run.sh' || (serviceTemplateInfo && file.path === serviceTemplateInfo.target_path))) {
                                 html += `<button class="btn btn-sm btn-warning ms-1" onclick="generateFile('${file.path}')">
                                             <i class="bi bi-magic"></i> Generate
                                          </button>`;
@@ -210,8 +211,8 @@
                         {% else %}
                         if (file.exists) {
                             // For sealed deployments, show View/Download buttons
-                            if (file.file_type === 'text') {
-                                // Text files: View + Download
+                            if (isEditable) {
+                                // Text/template files: View + Download
                                 html += `<a href="/deployments/edit?manifest=${manifestName}&version=${versionName}&file_path=${encodeURIComponent(file.path)}&edit=true" 
                                            class="btn btn-sm btn-info me-1" target="_blank"><i class="bi bi-eye"></i> View</a>`;
                                 html += `<a href="/deployments/download?manifest=${manifestName}&version=${versionName}&file_path=${encodeURIComponent(file.path)}" 

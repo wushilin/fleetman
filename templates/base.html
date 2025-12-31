@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}Fleetman{% endblock %}</title>
+    <link rel="icon" href="/favicon.ico">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.0/font/bootstrap-icons.css">
     <style>
@@ -23,8 +24,12 @@
 <body>
     <div class="container-fluid">
         <div class="row">
+            {% block sidebar %}
             <nav class="col-md-2 d-md-block sidebar p-3">
-                <h4 class="mb-4"><i class="bi bi-shield-check"></i> Fleetman</h4>
+                <h4 class="mb-4 d-flex align-items-center gap-2">
+                    <img src="/static/android-chrome-512x512.png" alt="Fleetman" width="28" height="28" style="border-radius: 6px;">
+                    <span>Fleetman</span>
+                </h4>
                 <ul class="nav flex-column">
                     <li class="nav-item">
                         <a class="nav-link {% block nav_dashboard %}{% endblock %}" href="/">
@@ -62,15 +67,93 @@
                         </a>
                     </li>
                 </ul>
+                <hr>
+                <form method="post" action="/logout">
+                    <button type="submit" class="btn btn-sm btn-outline-secondary w-100">
+                        <i class="bi bi-box-arrow-right"></i> Logout
+                    </button>
+                </form>
             </nav>
+            {% endblock %}
 
-            <main class="col-md-10 ms-sm-auto px-md-4 py-4">
+            <main class="{% block main_class %}col-md-10 ms-sm-auto px-md-4 py-4{% endblock %}">
                 {% block content %}{% endblock %}
             </main>
         </div>
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+    // --- CSRF helper (cookie-based) ---
+    // We rely on a CSRF cookie (fleetman_csrf). For normal forms, we inject a hidden `_csrf` field.
+    // For fetch() requests, we add X-CSRF-Token automatically for same-origin unsafe methods.
+    function __fleetmanGetCookie(name) {
+        const parts = document.cookie.split(';').map(s => s.trim());
+        for (const p of parts) {
+            if (!p) continue;
+            const idx = p.indexOf('=');
+            if (idx < 0) continue;
+            const k = p.slice(0, idx);
+            const v = p.slice(idx + 1);
+            if (k === name) return decodeURIComponent(v);
+        }
+        return '';
+    }
+
+    function __fleetmanEnsureCsrfField(form) {
+        if (!form) return;
+        const method = (form.getAttribute('method') || '').toLowerCase();
+        if (method !== 'post') return;
+        const token = __fleetmanGetCookie('fleetman_csrf');
+        if (!token) return;
+        let input = form.querySelector('input[name="_csrf"]');
+        if (!input) {
+            input = document.createElement('input');
+            input.type = 'hidden';
+            input.name = '_csrf';
+            form.appendChild(input);
+        }
+        input.value = token;
+    }
+
+    // Inject for normal submits
+    document.addEventListener('submit', function(e) {
+        __fleetmanEnsureCsrfField(e.target);
+    }, true);
+
+    // Inject for programmatic submits (form.submit() doesn't fire submit event)
+    (function() {
+        const orig = HTMLFormElement.prototype.submit;
+        HTMLFormElement.prototype.submit = function() {
+            try { __fleetmanEnsureCsrfField(this); } catch (_) {}
+            return orig.call(this);
+        };
+    })();
+
+    // Patch fetch to add CSRF token for same-origin unsafe requests
+    (function() {
+        const origFetch = window.fetch;
+        window.fetch = function(input, init) {
+            init = init || {};
+            const method = (init.method || 'GET').toUpperCase();
+            const unsafe = !(method === 'GET' || method === 'HEAD' || method === 'OPTIONS');
+            if (unsafe) {
+                const token = __fleetmanGetCookie('fleetman_csrf');
+                if (token) {
+                    init.headers = init.headers || {};
+                    try {
+                        const h = new Headers(init.headers);
+                        h.set('X-CSRF-Token', token);
+                        init.headers = h;
+                    } catch (_) {
+                        // ignore
+                    }
+                }
+            }
+            return origFetch(input, init);
+        };
+    })();
+    </script>
     {% block scripts %}{% endblock %}
 </body>
 </html>

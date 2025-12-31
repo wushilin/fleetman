@@ -5,14 +5,16 @@ mod s3_retry;
 use askama::Template;
 use axum::{
     body::Body,
-    extract::{Path as AxumPath, Query, State as AxumState},
+    body::to_bytes,
+    extract::{DefaultBodyLimit, Path as AxumPath, Query, State as AxumState},
+    http::{header, HeaderMap, Request},
     http::StatusCode,
     response::{Html, IntoResponse, Redirect, Response, Json},
     routing::{get, post},
     Form, Router,
 };
 use axum_extra::extract::Multipart;
-use aws_sdk_s3::{primitives::ByteStream, Client};
+use aws_sdk_s3::{primitives::ByteStream, types::{CompletedMultipartUpload, CompletedPart}, Client};
 use chrono::Local;
 use controller_config::{BucketConfig, CellConfig, ControllerConfig, DeploymentManifest, DeploymentProfile, FileType, ManifestFile};
 use controller_config::ResourceProfile;
@@ -26,6 +28,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 // (tokio::time::{sleep, Duration} were previously used by inline retry logic; now in `s3_retry`.)
 use tower_http::trace::TraceLayer;
 use futures::future::join_all;
+use once_cell::sync::Lazy;
+use std::sync::Mutex;
+use rand::RngCore;
+use base64::Engine as _;
 
 type AppState = Arc<RwLock<ControllerConfig>>;
 
@@ -34,11 +40,202 @@ use controller_s3::create_s3_client;
 
 const CONFIG_FILE: &str = "controller_config.yaml";
 
+// ===== Auth + session (in-memory) =====
+static SESSION_STORE: Lazy<Mutex<HashMap<String, String>>> = Lazy::new(|| Mutex::new(HashMap::new())); // session_id -> username
+
+const SESSION_COOKIE: &str = "fleetman_session";
+const CSRF_COOKIE: &str = "fleetman_csrf";
+
+static FAVICON_ICO: &[u8] = include_bytes!("../images/favicon.ico");
+static ANDROID_LOGO_512: &[u8] = include_bytes!("../images/android-chrome-512x512.png");
+
+fn parse_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
+    for part in raw.split(';') {
+        let p = part.trim();
+        if p.is_empty() {
+            continue;
+        }
+        let mut it = p.splitn(2, '=');
+        let k = it.next()?.trim();
+        let v = it.next()?.trim();
+        if k == name {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+fn make_set_cookie(name: &str, value: &str, http_only: bool, same_site: &str, max_age_seconds: Option<i64>) -> String {
+    let mut s = format!("{}={}; Path=/; SameSite={}", name, value, same_site);
+    if http_only {
+        s.push_str("; HttpOnly");
+    }
+    if let Some(sec) = max_age_seconds {
+        s.push_str(&format!("; Max-Age={}", sec));
+    }
+    s
+}
+
+fn ensure_csrf_cookie(headers: &HeaderMap) -> Option<String> {
+    if parse_cookie(headers, CSRF_COOKIE).is_some() {
+        return None;
+    }
+    // 32 bytes random, url-safe base64
+    let mut buf = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut buf);
+    let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(buf);
+    Some(make_set_cookie(CSRF_COOKIE, &token, false, "Strict", None))
+}
+
+fn is_auth_enabled(cfg: &ControllerConfig) -> bool {
+    cfg.web_console.auth.mode.trim().eq_ignore_ascii_case("form")
+}
+
+fn verify_user(cfg: &ControllerConfig, username: &str, password: &str) -> bool {
+    let u = username.trim();
+    if u.is_empty() {
+        return false;
+    }
+    for entry in &cfg.web_console.auth.users {
+        let mut it = entry.splitn(2, ':');
+        let user = it.next().unwrap_or("").trim();
+        let hash = it.next().unwrap_or("").trim();
+        if user == u && !hash.is_empty() {
+            return bcrypt::verify(password, hash).unwrap_or(false);
+        }
+    }
+    false
+}
+
+fn is_safe_next(next: &str) -> bool {
+    let n = next.trim();
+    n.starts_with('/') && !n.starts_with("//") && !n.contains("://")
+}
+
+fn same_origin(headers: &HeaderMap) -> bool {
+    let host = match headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
+        Some(h) => h,
+        None => return false,
+    };
+    let proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("http");
+    let expected = format!("{}://{}", proto, host);
+
+    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        return origin == expected;
+    }
+    if let Some(referer) = headers.get(header::REFERER).and_then(|v| v.to_str().ok()) {
+        return referer.starts_with(&expected);
+    }
+    false
+}
+
+async fn auth_csrf_middleware(
+    AxumState(state): AxumState<AppState>,
+    mut req: Request<Body>,
+    next: axum::middleware::Next,
+) -> Response {
+    let cfg = state.read().unwrap().clone();
+
+    // Ensure CSRF cookie exists
+    let new_csrf_cookie = ensure_csrf_cookie(req.headers());
+
+    // CSRF protection for unsafe methods:
+    let method = req.method().clone();
+    let unsafe_method = !(method == axum::http::Method::GET || method == axum::http::Method::HEAD || method == axum::http::Method::OPTIONS);
+    if unsafe_method {
+        let csrf_cookie = parse_cookie(req.headers(), CSRF_COOKIE).unwrap_or_default();
+        let hdr_token = req
+            .headers()
+            .get("x-csrf-token")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let content_type = req
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+
+        // Prefer header-based check (for fetch/json)
+        let ok = if !hdr_token.is_empty() && !csrf_cookie.is_empty() && hdr_token == csrf_cookie {
+            true
+        } else if content_type.starts_with("application/x-www-form-urlencoded") {
+            // Parse body and check _csrf
+            let (parts, body) = req.into_parts();
+            let bytes = to_bytes(body, 1024 * 1024).await.unwrap_or_default();
+            let body_str = String::from_utf8_lossy(&bytes).to_string();
+            let mut form_token = String::new();
+            for kv in body_str.split('&') {
+                let mut it = kv.splitn(2, '=');
+                let k = it.next().unwrap_or("");
+                let v = it.next().unwrap_or("");
+                if k == "_csrf" {
+                    form_token = urlencoding::decode(v).unwrap_or_else(|_| v.into()).to_string();
+                    break;
+                }
+            }
+            let ok = !csrf_cookie.is_empty() && form_token == csrf_cookie;
+            req = Request::from_parts(parts, Body::from(bytes));
+            ok
+        } else {
+            // For multipart and other bodies, fall back to same-origin protection.
+            same_origin(req.headers())
+        };
+
+        if !ok {
+            let mut resp = (StatusCode::FORBIDDEN, "CSRF validation failed").into_response();
+            if let Some(sc) = new_csrf_cookie {
+                resp.headers_mut().append(header::SET_COOKIE, sc.parse().unwrap());
+            }
+            return resp;
+        }
+    }
+
+    // Authentication
+    let path = req.uri().path();
+    let exempt = path == "/login"
+        || path == "/logout"
+        || path == "/favicon.ico"
+        || path.starts_with("/static/");
+    if is_auth_enabled(&cfg) && !exempt {
+        let sid = parse_cookie(req.headers(), SESSION_COOKIE).unwrap_or_default();
+        let ok = SESSION_STORE.lock().unwrap().contains_key(&sid);
+        if !ok {
+            let pq = req.uri().path_and_query().map(|x| x.as_str()).unwrap_or("/");
+            let next_q = urlencoding::encode(pq);
+            let mut resp = Redirect::to(&format!("/login?next={}", next_q)).into_response();
+            if let Some(sc) = new_csrf_cookie {
+                resp.headers_mut().append(header::SET_COOKIE, sc.parse().unwrap());
+            }
+            return resp;
+        }
+    }
+
+    let mut resp = next.run(req).await;
+    if let Some(sc) = new_csrf_cookie {
+        resp.headers_mut().append(header::SET_COOKIE, sc.parse().unwrap());
+    }
+    resp
+}
+
 #[derive(Template)]
 #[template(path = "dashboard.html")]
 struct DashboardTemplate {
     bucket_count: usize,
     manifest_count: usize,
+}
+
+#[derive(Template)]
+#[template(path = "login.html")]
+struct LoginTemplate {
+    next: String,
+    error: Option<String>,
 }
 
 #[derive(Template)]
@@ -368,7 +565,8 @@ fn default_override_mode(path: &str, file_type: &FileType) -> &'static str {
 }
 
 fn validate_run_sh(files: &[ManifestFile], profile: &DeploymentProfile) -> Result<(), String> {
-    // For systemd/processmaster (and legacy supervisor), require run.sh as a text file with mode >= 0700 and owner execute bit.
+    // For systemd/processmaster (and legacy supervisor), require run.sh with mode >= 0700 and owner execute bit.
+    // run.sh may be either a plain text file or a template file (rendered by FleetAgent).
     let require = matches!(
         profile,
         DeploymentProfile::Systemd | DeploymentProfile::ProcessMaster | DeploymentProfile::Supervisor
@@ -380,8 +578,8 @@ fn validate_run_sh(files: &[ManifestFile], profile: &DeploymentProfile) -> Resul
     let Some(f) = files.iter().find(|f| f.path == "run.sh") else {
         return Err(format!("run.sh is required for {} profile.", profile));
     };
-    if f.file_type != FileType::Text {
-        return Err("run.sh must be a text file.".to_string());
+    if !(f.file_type == FileType::Text || f.file_type == FileType::Template) {
+        return Err("run.sh must be a text or template file.".to_string());
     }
     // Mode is optional. If not specified, the agent defaults run.sh to 0700.
     if let Some(mstr) = f.mode.as_deref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -791,8 +989,17 @@ async fn main() {
     let config = load_or_create_config();
     let state = Arc::new(RwLock::new(config));
 
+    let upload_max_bytes = {
+        let cfg = state.read().unwrap();
+        (cfg.web_console.upload_max_bytes.min(usize::MAX as u64)) as usize
+    };
+
     let app = Router::new()
+        .route("/favicon.ico", get(favicon))
+        .route("/static/android-chrome-512x512.png", get(android_logo_512))
         .route("/", get(dashboard))
+        .route("/login", get(login_page).post(login_submit))
+        .route("/logout", post(logout))
         .route("/buckets", get(buckets_page))
         .route("/buckets/add", post(add_bucket))
         .route("/buckets/delete", post(delete_bucket))
@@ -860,13 +1067,21 @@ async fn main() {
         .route("/api/cell-version-exists", get(api_cell_version_exists))
         .route("/api/cell-versions-exist", get(api_cell_versions_exist))
         .layer(TraceLayer::new_for_http())
-        .with_state(state);
+        // Allow large uploads (multipart) as configured (Axum default is 2 MiB).
+        .layer(DefaultBodyLimit::max(upload_max_bytes))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth_csrf_middleware))
+        .with_state(state.clone());
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+    let (bind, port) = {
+        let cfg = state.read().unwrap();
+        (cfg.web_console.bind.clone(), cfg.web_console.port)
+    };
+
+    let listener = tokio::net::TcpListener::bind(format!("{}:{}", bind, port))
         .await
         .unwrap();
 
-    println!("🚀 Fleetman Controller running at http://0.0.0.0:3000");
+    println!("🚀 Fleetman Controller running at http://{}:{}", bind, port);
     axum::serve(listener, app).await.unwrap();
 }
 
@@ -893,6 +1108,76 @@ async fn dashboard(AxumState(state): AxumState<AppState>) -> impl IntoResponse {
         manifest_count: config.manifests.len(),
     };
     HtmlTemplate(template)
+}
+
+#[derive(Deserialize)]
+struct LoginQuery {
+    #[serde(default)]
+    next: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LoginForm {
+    username: String,
+    password: String,
+    #[serde(default)]
+    next: String,
+}
+
+async fn login_page(Query(q): Query<LoginQuery>) -> impl IntoResponse {
+    let next = q.next.unwrap_or_else(|| "/".to_string());
+    HtmlTemplate(LoginTemplate {
+        next: if is_safe_next(&next) { next } else { "/".to_string() },
+        error: None,
+    })
+}
+
+async fn login_submit(AxumState(state): AxumState<AppState>, Form(form): Form<LoginForm>) -> impl IntoResponse {
+    let cfg = state.read().unwrap().clone();
+    if !is_auth_enabled(&cfg) {
+        return Redirect::to("/").into_response();
+    }
+    if verify_user(&cfg, &form.username, &form.password) {
+        let sid = uuid::Uuid::new_v4().to_string();
+        SESSION_STORE.lock().unwrap().insert(sid.clone(), form.username.trim().to_string());
+        let cookie = make_set_cookie(SESSION_COOKIE, &sid, true, "Lax", Some(60 * 60 * 24));
+        let next = if is_safe_next(&form.next) { form.next } else { "/".to_string() };
+        let mut resp = Redirect::to(&next).into_response();
+        resp.headers_mut().append(header::SET_COOKIE, cookie.parse().unwrap());
+        return resp;
+    }
+    HtmlTemplate(LoginTemplate {
+        next: if is_safe_next(&form.next) { form.next } else { "/".to_string() },
+        error: Some("Invalid username or password".to_string()),
+    })
+    .into_response()
+}
+
+async fn logout(req: Request<Body>) -> impl IntoResponse {
+    let sid = parse_cookie(req.headers(), SESSION_COOKIE).unwrap_or_default();
+    if !sid.is_empty() {
+        SESSION_STORE.lock().unwrap().remove(&sid);
+    }
+    let clear = make_set_cookie(SESSION_COOKIE, "", true, "Lax", Some(0));
+    let mut resp = Redirect::to("/login").into_response();
+    resp.headers_mut().append(header::SET_COOKIE, clear.parse().unwrap());
+    resp
+}
+
+async fn favicon() -> impl IntoResponse {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/x-icon")
+        .body(Body::from(FAVICON_ICO))
+        .unwrap()
+}
+
+async fn android_logo_512() -> impl IntoResponse {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "image/png")
+        .body(Body::from(ANDROID_LOGO_512))
+        .unwrap()
 }
 
 #[derive(Deserialize)]
@@ -999,6 +1284,268 @@ fn parent_folder_prefix(prefix: &str) -> String {
     match p.rfind('/') {
         Some(idx) => format!("{}/", &p[..idx]),
         None => "".to_string(),
+    }
+}
+
+const MULTIPART_PART_SIZE_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
+
+fn parse_header_u64(headers: &HeaderMap, name: &str) -> Option<u64> {
+    let v = headers.get(name)?;
+    let s = v.to_str().ok()?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    s.parse::<u64>().ok()
+}
+
+async fn s3_abort_multipart_best_effort(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    retry_count: u32,
+    retry_delay_ms: u64,
+) {
+    let op = format!("multipart_abort:{}", key);
+    let bucket = bucket.to_string();
+    let key = key.to_string();
+    let upload_id = upload_id.to_string();
+    let _ = retry_s3_operation(&op, retry_count, retry_delay_ms, || {
+        let client = client.clone();
+        let bucket = bucket.clone();
+        let key = key.clone();
+        let upload_id = upload_id.clone();
+        async move {
+            client
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .send()
+                .await
+        }
+    })
+    .await;
+}
+
+async fn s3_flush_full_parts(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    completed_parts: &mut Vec<CompletedPart>,
+    part_number: &mut i32,
+    buf: &mut Vec<u8>,
+    retry_count: u32,
+    retry_delay_ms: u64,
+) -> Result<(), String> {
+    while buf.len() >= MULTIPART_PART_SIZE_BYTES {
+        let part_bytes: Vec<u8> = buf.drain(..MULTIPART_PART_SIZE_BYTES).collect();
+        let etag = s3_upload_part_with_retry(
+            client,
+            bucket,
+            key,
+            upload_id,
+            *part_number,
+            part_bytes,
+            retry_count,
+            retry_delay_ms,
+        )
+        .await?;
+        completed_parts.push(
+            CompletedPart::builder()
+                .e_tag(etag)
+                .part_number(*part_number)
+                .build(),
+        );
+        *part_number += 1;
+    }
+    Ok(())
+}
+
+async fn s3_upload_part_with_retry(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    data: Vec<u8>,
+    retry_count: u32,
+    retry_delay_ms: u64,
+) -> Result<String, String> {
+    let op = format!("multipart_upload_part:{}:{}", key, part_number);
+    let bucket = bucket.to_string();
+    let key = key.to_string();
+    let upload_id = upload_id.to_string();
+    let data_len = data.len();
+
+    let resp = retry_s3_operation(&op, retry_count, retry_delay_ms, || {
+        let client = client.clone();
+        let bucket = bucket.clone();
+        let key = key.clone();
+        let upload_id = upload_id.clone();
+        let data = data.clone();
+        async move {
+            client
+                .upload_part()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .part_number(part_number)
+                .content_length(data.len() as i64)
+                .body(ByteStream::from(data))
+                .send()
+                .await
+        }
+    })
+    .await
+    .map_err(|e| format!("upload_part failed (len={}): {:?}", data_len, e))?;
+
+    resp.e_tag()
+        .map(|s| s.to_string())
+        .ok_or_else(|| "upload_part missing ETag".to_string())
+}
+
+async fn s3_stream_multipart_upload_from_field(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    field: &mut axum_extra::extract::multipart::Field,
+    expected_len: Option<u64>,
+    normalize_crlf: bool,
+    retry_count: u32,
+    retry_delay_ms: u64,
+) -> Result<u64, String> {
+    let create_op = format!("multipart_create:{}", key);
+    let bucket_s = bucket.to_string();
+    let key_s = key.to_string();
+    let created = retry_s3_operation(&create_op, retry_count, retry_delay_ms, || {
+        let client = client.clone();
+        let bucket = bucket_s.clone();
+        let key = key_s.clone();
+        async move { client.create_multipart_upload().bucket(bucket).key(key).send().await }
+    })
+    .await
+    .map_err(|e| format!("create_multipart_upload failed: {:?}", e))?;
+
+    let upload_id = created
+        .upload_id()
+        .ok_or_else(|| "create_multipart_upload missing upload_id".to_string())?
+        .to_string();
+
+    let mut completed_parts: Vec<CompletedPart> = Vec::new();
+    let mut part_number: i32 = 1;
+    let mut buf: Vec<u8> = Vec::with_capacity(MULTIPART_PART_SIZE_BYTES * 2);
+    let mut total_out: u64 = 0;
+
+    let mut pending_cr = false;
+
+    // Read and stream
+    loop {
+        let chunk_opt = field
+            .chunk()
+            .await
+            .map_err(|e| format!("upload read failed: {}", e))?;
+        let Some(chunk) = chunk_opt else { break };
+
+        if !normalize_crlf {
+            total_out += chunk.len() as u64;
+            if let Some(exp) = expected_len {
+                if total_out > exp {
+                    s3_abort_multipart_best_effort(client, bucket, key, &upload_id, retry_count, retry_delay_ms).await;
+                    return Err(format!("upload exceeded declared length (got {}, expected {})", total_out, exp));
+                }
+            }
+            buf.extend_from_slice(chunk.as_ref());
+        } else {
+            for &b in chunk.as_ref() {
+                if pending_cr {
+                    if b == b'\n' {
+                        buf.push(b'\n');
+                        total_out += 1;
+                        pending_cr = false;
+                        continue;
+                    } else {
+                        buf.push(b'\r');
+                        total_out += 1;
+                        pending_cr = false;
+                    }
+                }
+                if b == b'\r' {
+                    pending_cr = true;
+                } else {
+                    buf.push(b);
+                    total_out += 1;
+                }
+            }
+        }
+
+        if let Err(e) = s3_flush_full_parts(
+            client,
+            bucket,
+            key,
+            &upload_id,
+            &mut completed_parts,
+            &mut part_number,
+            &mut buf,
+            retry_count,
+            retry_delay_ms,
+        )
+        .await
+        {
+            s3_abort_multipart_best_effort(client, bucket, key, &upload_id, retry_count, retry_delay_ms).await;
+            return Err(e);
+        }
+    }
+
+    if normalize_crlf && pending_cr {
+        buf.push(b'\r');
+        total_out += 1;
+    }
+
+    if let Some(exp) = expected_len {
+        if !normalize_crlf && total_out != exp {
+            s3_abort_multipart_best_effort(client, bucket, key, &upload_id, retry_count, retry_delay_ms).await;
+            return Err(format!("upload length mismatch (got {}, expected {})", total_out, exp));
+        }
+    }
+
+    // Flush final part (if any)
+    if !buf.is_empty() {
+        let etag = s3_upload_part_with_retry(
+            client,
+            bucket,
+            key,
+            &upload_id,
+            part_number,
+            std::mem::take(&mut buf),
+            retry_count,
+            retry_delay_ms,
+        )
+        .await
+        .map_err(|e| e)?;
+        completed_parts.push(CompletedPart::builder().e_tag(etag).part_number(part_number).build());
+    }
+
+    // Complete
+    let completed_upload = CompletedMultipartUpload::builder()
+        .set_parts(Some(completed_parts))
+        .build();
+
+    match client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(completed_upload)
+        .send()
+        .await
+    {
+        Ok(_) => Ok(total_out),
+        Err(e) => {
+            s3_abort_multipart_best_effort(client, bucket, key, &upload_id, retry_count, retry_delay_ms).await;
+            Err(format!("complete_multipart_upload failed: {:?}", e))
+        }
     }
 }
 
@@ -2486,8 +3033,8 @@ async fn bucket_object_upload(
     let mut bucket_display = String::new();
     let mut prefix = String::new();
     let mut override_filename = String::new();
-    let mut file_name: Option<String> = None;
-    let mut file_data: Vec<u8> = Vec::new();
+    let mut uploaded_prefix = String::new();
+    let mut did_upload = false;
 
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
@@ -2496,61 +3043,64 @@ async fn bucket_object_upload(
             "prefix" => prefix = field.text().await.unwrap_or_default(),
             "filename" => override_filename = field.text().await.unwrap_or_default(),
             "file" => {
-                file_name = field.file_name().map(|s| s.to_string());
-                file_data = field.bytes().await.unwrap_or_default().to_vec();
+                let mut f = field;
+                let file_name = f.file_name().map(|s| s.to_string());
+                let (bucket_cfg, retry_count, retry_delay_ms) = {
+                    let config = state.read().unwrap();
+                    match config.buckets.get(&bucket_display) {
+                        Some(bc) => (bc.clone(), config.s3_retry_count, config.s3_retry_delay_ms),
+                        None => return Redirect::to("/buckets?error=Bucket+not+found").into_response(),
+                    }
+                };
+
+                let prefix_norm = normalize_folder_prefix(prefix.clone());
+                let final_name = normalize_opt_string(&override_filename)
+                    .or(file_name)
+                    .unwrap_or_else(|| "upload.bin".to_string());
+                let key = if prefix_norm.is_empty() {
+                    final_name
+                } else {
+                    format!("{}{}", prefix_norm, final_name)
+                };
+
+                let expected_len = parse_header_u64(f.headers(), "content-length");
+
+                let client = create_s3_client(&bucket_cfg).await;
+                let bucket_name = bucket_cfg.bucket_name.clone();
+
+                match s3_stream_multipart_upload_from_field(
+                    &client,
+                    &bucket_name,
+                    &key,
+                    &mut f,
+                    expected_len,
+                    false,
+                    retry_count,
+                    retry_delay_ms,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        did_upload = true;
+                        uploaded_prefix = prefix_norm;
+                    }
+                    Err(e) => {
+                        eprintln!("bucket_object_upload error: {}", e);
+                        return Redirect::to("/buckets?error=Upload+failed").into_response();
+                    }
+                }
             }
             _ => {}
         }
     }
 
-    let (bucket_cfg, retry_count, retry_delay_ms) = {
-        let config = state.read().unwrap();
-        match config.buckets.get(&bucket_display) {
-            Some(bc) => (bc.clone(), config.s3_retry_count, config.s3_retry_delay_ms),
-            None => return Redirect::to("/buckets?error=Bucket+not+found").into_response(),
-        }
-    };
-
-    let prefix = normalize_folder_prefix(prefix);
-    let final_name = normalize_opt_string(&override_filename)
-        .or(file_name)
-        .unwrap_or_else(|| "upload.bin".to_string());
-    let key = if prefix.is_empty() {
-        final_name
-    } else {
-        format!("{}{}", prefix, final_name)
-    };
-
-    let client = create_s3_client(&bucket_cfg).await;
-    let bucket_name = bucket_cfg.bucket_name.clone();
-    let file_data = file_data;
-
-    let op_name = format!("bucket_object_upload: {}", key);
-    let _ = retry_s3_operation(
-        &op_name,
-        retry_count,
-        retry_delay_ms,
-        || {
-            let client = client.clone();
-            let bucket = bucket_name.clone();
-            let key = key.clone();
-            let file_data = file_data.clone();
-            async move {
-                client
-                    .put_object()
-                    .bucket(&bucket)
-                    .key(&key)
-                    .body(ByteStream::from(file_data))
-                    .send()
-                    .await
-            }
-        },
-    )
-    .await;
+    if !did_upload {
+        return Redirect::to("/buckets?error=No+file+uploaded").into_response();
+    }
 
     Redirect::to(&format!(
         "/buckets/manage?name={}&prefix={}",
-        bucket_display, prefix
+        bucket_display, uploaded_prefix
     ))
     .into_response()
 }
@@ -2798,6 +3348,7 @@ async fn add_manifest(
             path: path.clone(),
             file_type: match ftype.to_lowercase().as_str() {
                 "text" => FileType::Text,
+                "template" => FileType::Template,
                 "folder" => FileType::Folder,
                 _ => FileType::Binary,
             },
@@ -3320,6 +3871,7 @@ async fn update_manifest(
             path: path.clone(),
             file_type: match ftype.to_lowercase().as_str() {
                 "text" => FileType::Text,
+                "template" => FileType::Template,
                 "folder" => FileType::Folder,
                 _ => FileType::Binary,
             },
@@ -4883,47 +5435,71 @@ async fn upload_file(
     let mut manifest_name = String::new();
     let mut version = String::new();
     let mut remote_path = String::new();
-    let mut file_data: Vec<u8> = Vec::new();
+    let mut did_upload = false;
     
-    while let Some(field) = multipart.next_field().await.unwrap() {
+    while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
         
         match name.as_str() {
             "manifest" => manifest_name = field.text().await.unwrap_or_default(),
             "version" => version = field.text().await.unwrap_or_default(),
             "remote_path" => remote_path = field.text().await.unwrap_or_default(),
-            "file" => file_data = field.bytes().await.unwrap_or_default().to_vec(),
-            _ => {}
-        }
-    }
-    
-    // Clone config data before await and check file type
-    let (bucket_name, bucket_config, retry_count, retry_delay_ms, file_type) = {
-        let config = state.read().unwrap();
-        match config.manifests.get(&manifest_name) {
-            Some(manifest) => {
-                // Find file type for this path
-                let file_type = manifest.files.iter()
-                    .find(|f| f.path == remote_path)
-                    .map(|f| f.file_type.clone())
-                    .unwrap_or(FileType::Binary);
-                
-                match config.buckets.get(&manifest.bucket) {
-                    Some(bc) => (bc.bucket_name.clone(), bc.clone(), 
-                                config.s3_retry_count, config.s3_retry_delay_ms, file_type),
-                    None => return Redirect::to(&format!("/deployments/view?manifest={}&version={}", manifest_name, version)).into_response(),
-                }
-            }
-            None => return Redirect::to(&format!("/deployments/view?manifest={}&version={}", manifest_name, version)).into_response(),
-        }
-    }; // Lock dropped here
-    
-    let client = create_s3_client(&bucket_config).await;
-    
-    // Check if deployment is finalized (manifest.json exists)
-    if is_deployment_finalized(&client, &bucket_name, &manifest_name, &version, &bucket_config, retry_count, retry_delay_ms).await {
-        return Html(format!(
-            r#"<!DOCTYPE html>
+            "file" => {
+                let mut f = field;
+                // Resolve bucket + file type from config
+                let (bucket_name, bucket_config, retry_count, retry_delay_ms, file_type) = {
+                    let config = state.read().unwrap();
+                    match config.manifests.get(&manifest_name) {
+                        Some(manifest) => {
+                            let file_type = manifest
+                                .files
+                                .iter()
+                                .find(|ff| ff.path == remote_path)
+                                .map(|ff| ff.file_type.clone())
+                                .unwrap_or(FileType::Binary);
+                            match config.buckets.get(&manifest.bucket) {
+                                Some(bc) => (
+                                    bc.bucket_name.clone(),
+                                    bc.clone(),
+                                    config.s3_retry_count,
+                                    config.s3_retry_delay_ms,
+                                    file_type,
+                                ),
+                                None => {
+                                    return Redirect::to(&format!(
+                                        "/deployments/view?manifest={}&version={}",
+                                        manifest_name, version
+                                    ))
+                                    .into_response()
+                                }
+                            }
+                        }
+                        None => {
+                            return Redirect::to(&format!(
+                                "/deployments/view?manifest={}&version={}",
+                                manifest_name, version
+                            ))
+                            .into_response()
+                        }
+                    }
+                };
+
+                let client = create_s3_client(&bucket_config).await;
+
+                // Check if deployment is finalized (manifest.json exists)
+                if is_deployment_finalized(
+                    &client,
+                    &bucket_name,
+                    &manifest_name,
+                    &version,
+                    &bucket_config,
+                    retry_count,
+                    retry_delay_ms,
+                )
+                .await
+                {
+                    return Html(format!(
+                        r#"<!DOCTYPE html>
 <html>
 <head>
     <meta http-equiv="refresh" content="5;url=/deployments/view?manifest={}&version={}">
@@ -4940,49 +5516,57 @@ async fn upload_file(
     </div>
 </body>
 </html>"#,
-            manifest_name, version, version
-        )).into_response();
+                        manifest_name, version, version
+                    ))
+                    .into_response();
+                }
+
+                let base_key = format!("deployments/{}/{}/{}", manifest_name, version, remote_path);
+                let key = bucket_config.full_key(&base_key);
+
+                let normalize_crlf = matches!(file_type, FileType::Text | FileType::Template);
+                // Best-effort: honor per-part declared length if provided (rare for browser multipart).
+                // If we normalize CRLF, the declared length (if any) won't match output bytes.
+                let expected_len = if normalize_crlf {
+                    None
+                } else {
+                    parse_header_u64(f.headers(), "content-length")
+                };
+
+                match s3_stream_multipart_upload_from_field(
+                    &client,
+                    &bucket_name,
+                    &key,
+                    &mut f,
+                    expected_len,
+                    normalize_crlf,
+                    retry_count,
+                    retry_delay_ms,
+                )
+                .await
+                {
+                    Ok(_) => did_upload = true,
+                    Err(e) => {
+                        eprintln!("upload_file error: {}", e);
+                        return Redirect::to(&format!(
+                            "/deployments/view?manifest={}&version={}",
+                            manifest_name, version
+                        ))
+                        .into_response();
+                    }
+                }
+            }
+            _ => {}
+        }
     }
-    
-    let base_key = format!("deployments/{}/{}/{}", manifest_name, version, remote_path);
-    let key = bucket_config.full_key(&base_key);
-    
-    // For text files, normalize line endings to Unix (LF)
-    let file_data_normalized = if matches!(file_type, FileType::Text) {
-        // Convert to string, normalize, and back to bytes
-        match String::from_utf8(file_data.clone()) {
-            Ok(text) => {
-                let normalized = text.replace("\r\n", "\n");
-                normalized.into_bytes()
-            }
-            Err(_) => file_data, // Not valid UTF-8, use as-is
-        }
-    } else {
-        file_data
-    };
-    
-    let file_data_for_retry = file_data_normalized.clone();
-    let operation_name = format!("upload_file: {}", key);
-    let _ = retry_s3_operation(
-        &operation_name,
-        retry_count,
-        retry_delay_ms,
-        || {
-            let client = client.clone();
-            let bucket_name = bucket_name.clone();
-            let key = key.clone();
-            let file_data = file_data_for_retry.clone();
-            async move {
-                client
-                    .put_object()
-                    .bucket(&bucket_name)
-                    .key(&key)
-                    .body(ByteStream::from(file_data))
-                    .send()
-                    .await
-            }
-        }
-    ).await;
+
+    if !did_upload {
+        return Redirect::to(&format!(
+            "/deployments/view?manifest={}&version={}",
+            manifest_name, version
+        ))
+        .into_response();
+    }
     
     Redirect::to(&format!("/deployments/view?manifest={}&version={}", manifest_name, version)).into_response()
 }
@@ -8333,7 +8917,7 @@ async fn upload_cell_override(
     let mut owner = String::new();
     let mut group = String::new();
     let mut mode = String::new();
-    let mut file_data = Vec::new();
+    let mut did_upload = false;
     
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
@@ -8353,7 +8937,65 @@ async fn upload_cell_override(
         } else if name == "mode" {
             mode = field.text().await.unwrap_or_default();
         } else if name == "file" {
-            file_data = field.bytes().await.unwrap_or_default().to_vec();
+            let mut f = field;
+            // Only upload file content when source_type == "upload" and file_type != "folder"
+            if source_type == "upload" && file_type != "folder" {
+                // Validate file path (no relative paths, no path escape)
+                if file_path.is_empty()
+                    || file_path.starts_with('/')
+                    || file_path.starts_with("../")
+                    || file_path.starts_with("./")
+                    || file_path.contains("/./")
+                    || file_path.contains("/../")
+                {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Html("<html><head><meta http-equiv='refresh' content='3;url=/cells'></head><body>Invalid file path. Cannot use /, ../, ./, or path escape patterns.</body></html>"),
+                    )
+                        .into_response();
+                }
+
+                if !["text", "template", "binary", "folder"].contains(&file_type.as_str()) {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Html("<html><head><meta http-equiv='refresh' content='3;url=/cells'></head><body>Invalid file type. Must be text, template, binary, or folder.</body></html>"),
+                    )
+                        .into_response();
+                }
+
+                let normalized_file_path_for_upload = file_path.clone();
+                let key_base = format!(
+                    "cells/{}/{}/overrides/{}",
+                    node_id, cell_id, normalized_file_path_for_upload
+                );
+                let key = bucket_config.full_key(&key_base);
+
+                let normalize_crlf = file_type == "text" || file_type == "template";
+                let expected_len = if normalize_crlf {
+                    None
+                } else {
+                    parse_header_u64(f.headers(), "content-length")
+                };
+
+                match s3_stream_multipart_upload_from_field(
+                    &client,
+                    &bucket_name,
+                    &key,
+                    &mut f,
+                    expected_len,
+                    normalize_crlf,
+                    retry_count,
+                    retry_delay_ms,
+                )
+                .await
+                {
+                    Ok(_) => did_upload = true,
+                    Err(e) => {
+                        eprintln!("upload_cell_override error: {}", e);
+                        return Redirect::to(&format!("/cells/{}/{}/overrides", node_id, cell_id)).into_response();
+                    }
+                }
+            }
         }
     }
     
@@ -8368,10 +9010,10 @@ async fn upload_cell_override(
     }
     
     // Validate file type
-    if !["text", "binary", "folder"].contains(&file_type.as_str()) {
+    if !["text", "template", "binary", "folder"].contains(&file_type.as_str()) {
         return (
             StatusCode::BAD_REQUEST,
-            Html("<html><head><meta http-equiv='refresh' content='3;url=/cells'></head><body>Invalid file type. Must be text, binary, or folder.</body></html>")
+            Html("<html><head><meta http-equiv='refresh' content='3;url=/cells'></head><body>Invalid file type. Must be text, template, binary, or folder.</body></html>")
         ).into_response();
     }
     
@@ -8381,130 +9023,57 @@ async fn upload_cell_override(
     } else {
         file_path.clone()
     };
-    
-    // Get file data based on source type (skip for folders)
-    let file_data_result = if file_type == "folder" {
-        Ok(Vec::new()) // Folders don't have content
+
+    // Upload/copy object into overrides/
+    let key_base = format!("cells/{}/{}/overrides/{}", node_id, cell_id, normalized_file_path);
+    let key = bucket_config.full_key(&key_base);
+
+    if file_type == "folder" {
+        // For folders, create a placeholder object
+        let upload_op = format!("upload_cell_override_folder: {}", key);
+        let _ = retry_s3_operation(&upload_op, retry_count, retry_delay_ms, || {
+            let client = client.clone();
+            let bucket = bucket_name.clone();
+            let key = key.clone();
+            async move {
+                client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key(&key)
+                    .body(ByteStream::from(vec![]))
+                    .send()
+                    .await
+            }
+        })
+        .await;
     } else if source_type == "staging" {
-        // Copy from staging
         if staging_path.is_empty() {
             return (
                 StatusCode::BAD_REQUEST,
-                Html("<html><head><meta http-equiv='refresh' content='3;url=/cells'></head><body>No staging file selected</body></html>")
-            ).into_response();
+                Html("<html><head><meta http-equiv='refresh' content='3;url=/cells'></head><body>No staging file selected</body></html>"),
+            )
+                .into_response();
         }
-        
-        // Staging is under the bucket prefix
+
         let staging_key = bucket_config.full_key(&format!("staging/{}", staging_path));
-        let get_op = format!("get_staging_file: {}", staging_key);
-        
-        match retry_s3_operation(
-            &get_op,
-            retry_count,
-            retry_delay_ms,
-            || {
-                let client = client.clone();
-                let bucket = bucket_name.clone();
-                let key = staging_key.clone();
-                async move {
-                    client
-                        .get_object()
-                        .bucket(&bucket)
-                        .key(&key)
-                        .send()
-                        .await
-                }
-            }
-        ).await {
-            Ok(resp) => {
-                match resp.body.collect().await {
-                    Ok(data) => Ok(data.to_vec()),
-                    Err(e) => Err(format!("Failed to read staging file: {}", e)),
-                }
-            }
-            Err(e) => Err(format!("Failed to get staging file: {}", e)),
-        }
+        let copy_source = format!("{}/{}", bucket_name, staging_key);
+        let copy_op = format!("upload_cell_override:copy:{}->{}", staging_key, key);
+        let _ = retry_s3_operation(&copy_op, retry_count, retry_delay_ms, || {
+            let client = client.clone();
+            let bucket = bucket_name.clone();
+            let copy_source = copy_source.clone();
+            let key = key.clone();
+            async move { client.copy_object().bucket(&bucket).copy_source(copy_source).key(key).send().await }
+        })
+        .await;
     } else {
-        // Upload from computer
-        if file_data.is_empty() {
+        if !did_upload {
             return (
                 StatusCode::BAD_REQUEST,
-                Html("<html><head><meta http-equiv='refresh' content='3;url=/cells'></head><body>No file uploaded</body></html>")
-            ).into_response();
+                Html("<html><head><meta http-equiv='refresh' content='3;url=/cells'></head><body>No file uploaded</body></html>"),
+            )
+                .into_response();
         }
-        Ok(file_data)
-    };
-    
-    let file_data = match file_data_result {
-        Ok(data) => data,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Html(format!("<html><head><meta http-equiv='refresh' content='3;url=/cells'></head><body>Error: {}</body></html>", e))
-            ).into_response();
-        }
-    };
-    
-    // Upload file to S3 (for non-folders)
-    if !file_data.is_empty() {
-        let key_base = format!("cells/{}/{}/overrides/{}", node_id, cell_id, normalized_file_path);
-        let key = bucket_config.full_key(&key_base);
-        
-        // For text files (valid UTF-8), normalize line endings to Unix (LF)
-        let file_data_normalized = match String::from_utf8(file_data.clone()) {
-            Ok(text) => {
-                let normalized = text.replace("\r\n", "\n");
-                normalized.into_bytes()
-            }
-            Err(_) => file_data, // Binary file, use as-is
-        };
-        
-        let upload_op = format!("upload_cell_override: {}", key);
-        let _ = retry_s3_operation(
-            &upload_op,
-            retry_count,
-            retry_delay_ms,
-            || {
-                let client = client.clone();
-                let bucket = bucket_name.clone();
-                let key = key.clone();
-                let data = file_data_normalized.clone();
-                async move {
-                    client
-                        .put_object()
-                        .bucket(&bucket)
-                        .key(&key)
-                        .body(ByteStream::from(data))
-                        .send()
-                        .await
-                }
-            }
-        ).await;
-    } else if file_type == "folder" {
-        // For folders, create a placeholder object
-        let key_base = format!("cells/{}/{}/overrides/{}", node_id, cell_id, normalized_file_path);
-        let key = bucket_config.full_key(&key_base);
-        
-        let upload_op = format!("upload_cell_override_folder: {}", key);
-        let _ = retry_s3_operation(
-            &upload_op,
-            retry_count,
-            retry_delay_ms,
-            || {
-                let client = client.clone();
-                let bucket = bucket_name.clone();
-                let key = key.clone();
-                async move {
-                    client
-                        .put_object()
-                        .bucket(&bucket)
-                        .key(&key)
-                        .body(ByteStream::from(vec![]))
-                        .send()
-                        .await
-                }
-            }
-        ).await;
     }
     
     // Update manifest with metadata
@@ -8514,6 +9083,7 @@ async fn upload_cell_override(
     // Parse file type
     let ft = match file_type.as_str() {
         "text" => FileType::Text,
+        "template" => FileType::Template,
         "binary" => FileType::Binary,
         "folder" => FileType::Folder,
         _ => FileType::Binary,
@@ -8814,6 +9384,7 @@ async fn update_cell_override_meta(
     // Parse file type
     let ft = match form.file_type.as_str() {
         "text" => FileType::Text,
+        "template" => FileType::Template,
         "binary" => FileType::Binary,
         "folder" => FileType::Folder,
         _ => FileType::Binary,

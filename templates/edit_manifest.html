@@ -113,6 +113,7 @@
                                 <select class="form-select form-select-sm file-type-select">
                                     <option value="binary" {% match file.file_type %}{% when FileType::Binary %}selected{% when _ %}{% endmatch %}>Binary</option>
                                     <option value="text" {% match file.file_type %}{% when FileType::Text %}selected{% when _ %}{% endmatch %}>Text</option>
+                                    <option value="template" {% match file.file_type %}{% when FileType::Template %}selected{% when _ %}{% endmatch %}>Template</option>
                                     <option value="folder" {% match file.file_type %}{% when FileType::Folder %}selected{% when _ %}{% endmatch %}>Folder</option>
                                 </select>
                             </div>

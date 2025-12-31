@@ -13,6 +13,8 @@ pub struct ControllerConfig {
     pub s3_retry_count: u32,
     #[serde(default = "default_s3_retry_delay_ms")]
     pub s3_retry_delay_ms: u64,
+    #[serde(default)]
+    pub web_console: WebConsoleConfig,
 }
 
 fn default_s3_retry_count() -> u32 {
@@ -32,6 +34,65 @@ impl ControllerConfig {
             resource_profiles: HashMap::new(),
             s3_retry_count: default_s3_retry_count(),
             s3_retry_delay_ms: default_s3_retry_delay_ms(),
+            web_console: WebConsoleConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WebConsoleConfig {
+    #[serde(default = "default_bind")]
+    pub bind: String,
+    #[serde(default = "default_port")]
+    pub port: u16,
+    /// Max allowed HTTP request body size (bytes). This primarily affects file uploads (multipart).
+    /// Axum's default is 2 MiB; we keep that as the default unless configured.
+    #[serde(default = "default_upload_max_bytes")]
+    pub upload_max_bytes: u64,
+    #[serde(default)]
+    pub auth: WebAuthConfig,
+}
+
+fn default_bind() -> String {
+    "0.0.0.0".to_string()
+}
+
+fn default_port() -> u16 {
+    3000
+}
+
+fn default_upload_max_bytes() -> u64 {
+    2_097_152 // 2 MiB (Axum default)
+}
+
+impl Default for WebConsoleConfig {
+    fn default() -> Self {
+        Self {
+            bind: default_bind(),
+            port: default_port(),
+            upload_max_bytes: default_upload_max_bytes(),
+            auth: WebAuthConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WebAuthConfig {
+    #[serde(default = "default_auth_mode")]
+    pub mode: String, // "none" | "form"
+    #[serde(default)]
+    pub users: Vec<String>, // "user:bcrypt_hash"
+}
+
+fn default_auth_mode() -> String {
+    "none".to_string()
+}
+
+impl Default for WebAuthConfig {
+    fn default() -> Self {
+        Self {
+            mode: default_auth_mode(),
+            users: Vec::new(),
         }
     }
 }
@@ -233,6 +294,7 @@ pub struct ManifestFile {
 #[serde(rename_all = "lowercase")]
 pub enum FileType {
     Text,
+    Template,
     Binary,
     Folder,
 }
@@ -241,6 +303,7 @@ impl std::fmt::Display for FileType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FileType::Text => write!(f, "text"),
+            FileType::Template => write!(f, "template"),
             FileType::Binary => write!(f, "binary"),
             FileType::Folder => write!(f, "folder"),
         }

@@ -47,7 +47,7 @@
                         <td>{% if file.is_folder %}-{% else %}{{ file.size }} bytes{% endif %}</td>
                         <td>{{ file.last_modified }}</td>
                         <td>
-                            {% if file.file_type == "text" %}
+                            {% if file.file_type == "text" || file.file_type == "template" %}
                             <a href="/cells/{{ node_id }}/{{ cell_id }}/overrides/edit?file_path={{ file.path }}" 
                                class="btn btn-sm btn-primary">Edit</a>
                             {% else %}
@@ -94,6 +94,7 @@
                 <label for="file_type" class="form-label">File Type</label>
                 <select class="form-control" id="file_type" name="file_type" onchange="updateFileTypeUI()">
                     <option value="text">Text</option>
+                    <option value="template">Template</option>
                     <option value="binary">Binary</option>
                     <option value="folder">Folder</option>
                 </select>
